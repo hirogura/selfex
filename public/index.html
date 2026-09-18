@@ -65,16 +65,18 @@
             <div class="file-list split-file-list" id="split-file-list"></div>
           </div>
         </div>
-        <div class="split-pane term-pane" id="term-pane" hidden>
-          <div class="split-toolbar">
-            <span class="split-title">ターミナル</span>
-            <span class="item-count" id="term-cwd"></span>
-            <span class="split-toolbar-spacer"></span>
-            <button class="term-btn" id="term-clear" title="画面をクリア">クリア</button>
-          </div>
-          <div class="term-container" id="term-container"></div>
-        </div>
       </main>
+      <div class="term-resize-handle" id="term-resize-handle" hidden title="ターミナルの幅"></div>
+      <aside class="term-pane" id="term-pane" hidden>
+        <div class="term-pane-header">
+          <span class="split-title">ターミナル</span>
+          <span class="item-count" id="term-cwd"></span>
+          <span class="split-toolbar-spacer"></span>
+          <button class="term-btn" id="term-clear" title="画面をクリア">クリア</button>
+          <button class="term-btn" id="term-close" title="閉じる">✕</button>
+        </div>
+        <div class="term-container" id="term-container"></div>
+      </aside>
       <aside class="right-sidebar" id="right-sidebar">
         <div class="sidebar-header"><h3>アプリ連携</h3></div>
         <div class="right-sidebar-body">

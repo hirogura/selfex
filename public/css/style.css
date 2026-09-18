@@ -132,6 +132,7 @@ body{font-family:"Segoe UI Variable","Segoe UI",system-ui,-apple-system,sans-ser
 .split-resize-handle{height:5px;flex-shrink:0;background:transparent;cursor:row-resize;transition:background .15s;position:relative;z-index:5;border-top:1px solid var(--border-color)}
 .split-resize-handle:hover,.split-resize-handle:active{background:var(--accent-color)}
 .split-pane{flex:1;min-height:80px;display:flex;flex-direction:column;overflow:hidden;border-top:1px solid var(--border-color);background:var(--bg-primary)}
+.split-pane[hidden],.split-resize-handle[hidden]{display:none}
 .split-toolbar{display:flex;align-items:center;gap:8px;padding:6px 14px;border-bottom:1px solid var(--border-color)}
 .split-title{font-size:11px;text-transform:uppercase;color:var(--text-tertiary);letter-spacing:.5px;font-weight:600;white-space:nowrap}
 .split-path-bar{flex:1}

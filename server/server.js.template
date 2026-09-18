@@ -9,6 +9,7 @@ const path = require('path');
 const fs = require('fs');
 const crypto = require('crypto');
 const http = require('http');
+const WebSocket = require('ws');
 const { execFile } = require('child_process');
 
 const PORT = parseInt(process.env.PORT || '__PORT__', 10);
@@ -2447,7 +2448,106 @@ async function bootRestoreWeb() {
 /* 起動時に前回の実行結果をメモリへ1回だけ復元する（bkLoad は副作用なしのためここで行う） */
 try { bkLastRun = bkLoad().lastRun || null; } catch (e) { bkLastRun = null; }
 
-app.listen(PORT, HOST, () => {
+/* ── WebSocket ターミナル（servEX と同方式。サービス実行ユーザーで bash を起動） ── */
+const termServer = http.createServer(app);
+const termWss = new WebSocket.Server({ server: termServer, path: '/ws/terminal' });
+
+/* ターミナルセッション: id -> { term, buf, conns, cwd } */
+const termSessions = new Map();
+const TERM_BUF_MAX = 512 * 1024;
+const TERM_WELCOME = '\r\n\x1b[90m— selfEx terminal —\x1b[0m\r\n';
+
+function termSpawn(rec, dir) {
+  const nodePty = require('node-pty');
+  const old = rec.term;
+  const cols = old ? old.cols : 100;
+  const rows = old ? old.rows : 30;
+  if (old) {
+    old._respawn = true;
+    try { old.kill(); } catch (e) {}
+  }
+  const child = nodePty.spawn('bash', ['-l'], {
+    name: 'xterm-256color',
+    cols, rows,
+    cwd: dir || ROOT_DIR,
+    env: Object.assign({}, process.env, { TERM: 'xterm-256color', COLORTERM: 'truecolor' })
+  });
+  rec.term = child;
+  rec.buf = '';
+  rec.cwd = dir;
+  child.onData((data) => {
+    rec.buf += data;
+    if (rec.buf.length > TERM_BUF_MAX) rec.buf = rec.buf.slice(rec.buf.length - TERM_BUF_MAX);
+    const s = JSON.stringify({ type: 'data', data });
+    for (const c of Array.from(rec.conns)) {
+      if (c.readyState === c.OPEN) { try { c.send(s); } catch (e) {} }
+    }
+  });
+  child.onExit(({ exitCode }) => {
+    if (child._respawn) { child._respawn = false; return; }
+    if (termSessions.get(rec.id) === rec && rec.term === child) termSessions.delete(rec.id);
+    try { if (child.pid && process.getpgid(child.pid) === child.pid) process.kill(-child.pid, 'SIGHUP'); } catch (e) {}
+    try { child.kill(); } catch (e) {}
+    const s = JSON.stringify({ type: 'exit', code: exitCode });
+    for (const c of Array.from(rec.conns)) {
+      if (c.readyState === c.OPEN) { try { c.send(s); } catch (e) {} }
+    }
+  });
+  return child;
+}
+
+termWss.on('connection', (ws, req) => {
+  const q = new URL(req.url || '/', 'http://localhost').searchParams;
+  const id = q.get('id') || ('t-' + Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 8));
+  let startDir = ROOT_DIR;
+  try {
+    const c = q.get('cwd');
+    if (c != null && c !== '') {
+      const resolved = path.resolve(ROOT_DIR, c);
+      if (fs.existsSync(resolved) && fs.statSync(resolved).isDirectory()) startDir = resolved;
+    }
+  } catch (e) {}
+  let rec = termSessions.get(id);
+  const fresh = !rec || !rec.term;
+  if (fresh) {
+    try {
+      rec = { id, term: null, buf: '', conns: new Set(), cwd: startDir };
+      termSessions.set(id, rec);
+      termSpawn(rec, startDir);
+    } catch (e) {
+      ws.send(JSON.stringify({ type: 'data', data: '\r\n\x1b[31m[selfEx] ' + (e.message || e) + '\x1b[0m\r\n' }));
+      try { ws.close(); } catch (err) {}
+      return;
+    }
+  }
+  rec.conns.add(ws);
+  ws.send(JSON.stringify({ type: 'data', data: fresh ? TERM_WELCOME : rec.buf }));
+  ws.on('message', (raw) => {
+    try {
+      const msg = JSON.parse(String(raw));
+      const t = rec.term;
+      if (!t) return;
+      if (msg.type === 'input') {
+        t.write(msg.data);
+      } else if (msg.type === 'resize') {
+        t.resize(Number(msg.cols) || 80, Number(msg.rows) || 24);
+      } else if (msg.type === 'cd') {
+        const dir = String(msg.path || '');
+        if (dir) rec.cwd = dir;
+        t.write('cd ' + JSON.stringify(dir) + ' && clear\n');
+      } else if (msg.type === 'kill') {
+        try { t.kill(); } catch (e) {}
+        try { if (t.pid && process.getpgid(t.pid) === t.pid) process.kill(-t.pid, 'SIGHUP'); } catch (e) {}
+        termSessions.delete(id);
+        try { ws.close(); } catch (e) {}
+      }
+    } catch (e) {}
+  });
+  ws.on('close', () => { if (rec) rec.conns.delete(ws); });
+  ws.on('error', () => { if (rec) rec.conns.delete(ws); });
+});
+
+termServer.listen(PORT, HOST, () => {
   console.log(`selfEx listening on http://${HOST}:${PORT}`);
   console.log(`Root: ${ROOT_DIR}`);
   bootRestoreWeb();

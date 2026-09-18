@@ -1,0 +1,38 @@
+# Dependencies
+node_modules/
+server/node_modules/
+
+# Server (contains security keys / secrets)
+server/server.js
+
+# Environment files & secrets
+.env
+.env.*
+!.env.example
+credentials.*
+secrets.*
+.git-credentials
+*.pem
+*.key
+*.p12
+*.pfx
+
+# Logs
+*.log
+logs/
+
+# Data / backups (never commit)
+*.db
+*.sqlite
+*.sqlite3
+*.sql
+*.dump
+*.backup
+*.bak
+backup/
+backups/
+data/
+uploads/
+
+.DS_Store
+Thumbs.db

@@ -1,0 +1,2306 @@
+#!/usr/bin/env node
+'use strict';
+
+const express = require('express');
+const multer = require('multer');
+const mime = require('mime-types');
+const archiver = require('archiver');
+const path = require('path');
+const fs = require('fs');
+const crypto = require('crypto');
+const http = require('http');
+const { execFile } = require('child_process');
+
+const PORT = parseInt(process.env.PORT || '__PORT__', 10);
+const OO_PORT = parseInt(process.env.ONLYOFFICE_PORT || '__OO_PORT__', 10);
+const WEB_PORT = parseInt(process.env.WEB_SERVER_PORT || '3358', 10);
+const HOST = '127.0.0.1';
+const ROOT_DIR = path.resolve(process.env.ROOT_DIR || '__ROOT_DIR__');
+const ONLYOFFICE_URL = (process.env.ONLYOFFICE_URL || '').replace(/\/+$/, '');
+const ONLYOFFICE_SECRET = process.env.ONLYOFFICE_SECRET || '__OO_SECRET__';
+const PUBLIC_URL = (process.env.PUBLIC_URL || '').replace(/\/+$/, '');
+const OO_DIR = '/opt/onlyoffice';
+const OO_COMPOSE_FILE = path.join(OO_DIR, 'docker-compose.yml');
+const OO_SERVICE_NAME = 'selfex';
+const FONT_DIR = path.join(ROOT_DIR, 'Fonts');
+const FF_SCRIPT = path.join(__dirname, '..', 'add-fonts.sh');
+const { spawn } = require('child_process');
+const PKG = JSON.parse(fs.readFileSync(path.join(__dirname, '..', 'package.json'), 'utf8'));
+
+function sh(cmd, args, opts = {}) {
+  return new Promise((resolve, reject) => {
+    execFile(cmd, args, {
+      timeout: opts.timeout || 30000,
+      maxBuffer: 20 * 1024 * 1024,
+      cwd: opts.cwd
+    }, (err, stdout, stderr) => {
+      if (err) { err.stdout = stdout; err.stderr = stderr; return reject(err); }
+      resolve({ stdout, stderr });
+    });
+  });
+}
+
+async function ooHealthy() {
+  try {
+    const r = await fetch('http://127.0.0.1:' + OO_PORT + '/healthcheck', { signal: AbortSignal.timeout(2500) });
+    return (await r.text()).trim() === 'true';
+  } catch (e) { return false; }
+}
+
+async function ooContainerRunning() {
+  try {
+    const r = await sh('docker', ['ps', '--filter', 'name=onlyoffice', '--filter', 'status=running', '-q'], { timeout: 15000 });
+    return r.stdout.trim().length > 0;
+  } catch (e) { return false; }
+}
+
+async function ooComposeCommand() {
+  try { await sh('docker', ['compose', 'version'], { timeout: 20000 }); return { cmd: 'docker', baseArgs: ['compose'] }; }
+  catch (e) {}
+  try { await sh('docker-compose', ['version'], { timeout: 20000 }); return { cmd: 'docker-compose', baseArgs: [] }; } catch (e) {}
+  throw new Error('docker compose プラグインが見つかりません');
+}
+
+async function ooDockerDaemonReady(deadlineMs) {
+  const deadline = Date.now() + deadlineMs;
+  while (Date.now() < deadline) {
+    try { await sh('docker', ['info'], { timeout: 10000 }); return true; } catch (e) {}
+    await new Promise(r => setTimeout(r, 3000));
+  }
+  return false;
+}
+
+function ooReadComposeSecret() {
+  try {
+    const m = fs.readFileSync(OO_COMPOSE_FILE, 'utf8').match(/JWT_SECRET:\s*"([^"]+)"/);
+    return m ? m[1] : '';
+  } catch (e) { return ''; }
+}
+
+/* 実行時に有効なシークレットを解決: 環境変数 > コンテナ側 (docker-compose.yml) > 既定値 */
+function ooActiveSecret() {
+  if (process.env.ONLYOFFICE_SECRET) return ONLYOFFICE_SECRET;
+  return ooReadComposeSecret() || ONLYOFFICE_SECRET;
+}
+
+function ooServerSecretFile() {
+  return path.join(__dirname, 'server.js');
+}
+
+function ooCurrentServerSecret() {
+  try {
+    const m = fs.readFileSync(ooServerSecretFile(), 'utf8')
+      .match(/const ONLYOFFICE_SECRET = process\.env\.ONLYOFFICE_SECRET \|\| '([^']*)'/);
+    return m ? m[1] : ONLYOFFICE_SECRET;
+  } catch (e) { return ONLYOFFICE_SECRET; }
+}
+
+function ooSetServerSecret(secret) {
+  const file = ooServerSecretFile();
+  let src = fs.readFileSync(file, 'utf8');
+  src = src.replace(/const ONLYOFFICE_SECRET = process\.env\.ONLYOFFICE_SECRET \|\| '[^']*'/,
+    "const ONLYOFFICE_SECRET = process.env.ONLYOFFICE_SECRET || '" + secret + "'");
+  fs.writeFileSync(file, src);
+}
+
+function ooEditorUrl(req) {
+  if (ONLYOFFICE_URL) return ONLYOFFICE_URL;
+  const proto = publicProto(req);
+  const host = publicHost(req);
+  return proto + '://' + swapPort(host, OO_PORT);
+}
+
+/* ── 実行環境チェック（LXD コンテナ / Nesting 判定） ── */
+async function ooDevLxdInfo() {
+  try {
+    if (!fs.existsSync('/dev/lxd/sock')) return null;
+    const out = (await sh('curl', ['-sf', '--max-time', '3', '--unix-socket', '/dev/lxd/sock', 'http://local/1.0'], { timeout: 8000 })).stdout;
+    return JSON.parse(out);
+  } catch (e) { return null; }
+}
+
+function ooReadAttrCurrent() {
+  for (const f of ['/proc/self/attr/current', '/proc/self/attr/apparmor/current']) {
+    try { const v = fs.readFileSync(f, 'utf8').trim(); if (v) return v; } catch (e) {}
+  }
+  return '';
+}
+
+function ooHasCapSysAdmin() {
+  try {
+    const m = fs.readFileSync('/proc/self/status', 'utf8').match(/^CapEff:\s*([0-9a-f]+)/m);
+    if (!m) return null;
+    return ((BigInt('0x' + m[1]) >> BigInt(21)) & BigInt(1)) === BigInt(1);
+  } catch (e) { return null; }
+}
+
+async function ooEnvCheck() {
+  let virt = 'none';
+  try { virt = (await sh('systemd-detect-virt', ['-c'], { timeout: 5000 })).stdout.trim(); } catch (e) {}
+  let isLxc = false;
+  if (virt === 'lxc' || virt === 'lxd') isLxc = true;
+  else {
+    try { if (/container=(lxc|lxd)/.test(fs.readFileSync('/proc/1/environ', 'utf8'))) { isLxc = true; virt = 'lxc'; } } catch (e) {}
+  }
+  if (!isLxc && fs.existsSync('/dev/lxd/sock')) { isLxc = true; virt = 'lxc'; }
+  let containerName = '';
+  let hostName = '';
+  if (isLxc) {
+    const d = await ooDevLxdInfo();
+    if (d && d.location) hostName = d.location;
+    try { containerName = fs.readFileSync('/etc/hostname', 'utf8').trim(); } catch (e) {}
+  }
+  const attr = ooReadAttrCurrent();
+  const nestingProfile = attr.includes(':lxd-nesting:');
+  const capSysAdmin = ooHasCapSysAdmin();
+  const nestingOk = isLxc ? (nestingProfile || capSysAdmin === true) : true;
+  return { virt, isLxc, containerName, hostName, nestingProfile, capSysAdmin, nestingOk };
+}
+
+/* ── フォント追加（add-fonts.sh 連携） ── */
+function ffDirExists() {
+  try { return fs.statSync(FONT_DIR).isDirectory(); } catch (e) { return false; }
+}
+
+function ffCountFonts() {
+  const re = /\.(ttf|otf|woff2?)$/i;
+  let n = 0;
+  try {
+    for (const e of fs.readdirSync(FONT_DIR, { withFileTypes: true })) {
+      if (e.isFile() && re.test(e.name)) n++;
+      else if (e.isDirectory()) {
+        try {
+          for (const e2 of fs.readdirSync(path.join(FONT_DIR, e.name), { withFileTypes: true })) {
+            if (e2.isFile() && re.test(e2.name)) n++;
+          }
+        } catch (err) {}
+      }
+    }
+  } catch (e) {}
+  return n;
+}
+
+function ffMounted() {
+  try { return fs.readFileSync(OO_COMPOSE_FILE, 'utf8').includes('/usr/share/fonts/custom'); } catch (e) { return false; }
+}
+
+let ffInstalling = false;
+
+/* Nesting の自動変更はホスト側 lxc CLI が利用できる場合のみ試みる */
+async function ooTryEnableNesting(name) {
+  let names = null;
+  try {
+    names = (await sh('lxc', ['list', '--format', 'csv', '-c', 'n'], { timeout: 15000 })).stdout.split('\n').map(s => s.trim()).filter(Boolean);
+  } catch (e) { return { result: 'no-cli' }; }
+  if (!name || !names.includes(name)) return { result: 'not-found' };
+  try {
+    await sh('lxc', ['config', 'set', name, 'security.nesting', 'true'], { timeout: 20000 });
+    return { result: 'set' };
+  } catch (e) { return { result: 'fail', error: e.message || String(e) }; }
+}
+
+const app = express();
+app.use(express.json({ limit: '20mb' }));
+
+function sendErr(res, msg, status) {
+  return res.status(status || 400).json({ success: false, error: msg });
+}
+
+function toRel(abs) {
+  return path.relative(ROOT_DIR, abs).split(path.sep).join('/');
+}
+
+function safeResolve(p) {
+  const abs = path.resolve(ROOT_DIR, String(p || ''));
+  const check = path.relative(ROOT_DIR, abs);
+  if (check === '..' || check.startsWith('..' + path.sep) || path.isAbsolute(check)) {
+    const e = new Error('Invalid path');
+    e.status = 400;
+    throw e;
+  }
+  return abs;
+}
+
+function isDir(p) {
+  return fs.statSync(p).isDirectory();
+}
+
+async function hasChildren(dir) {
+  try {
+    const entries = await fs.promises.readdir(dir);
+    for (const name of entries) {
+      if (fs.statSync(path.join(dir, name)).isDirectory()) return true;
+    }
+  } catch (e) {}
+  return false;
+}
+
+function b64url(buf) {
+  return Buffer.from(buf).toString('base64').replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+}
+
+function signJwt(payload) {
+  const header = b64url(JSON.stringify({ alg: 'HS256', typ: 'JWT' }));
+  const body = b64url(JSON.stringify(payload));
+  const sig = crypto.createHmac('sha256', ooActiveSecret()).update(header + '.' + body).digest();
+  return header + '.' + body + '.' + b64url(sig);
+}
+
+function verifyJwt(token) {
+  const parts = String(token || '').split('.');
+  if (parts.length !== 3) return null;
+  const [h, b, s] = parts;
+  const expected = crypto.createHmac('sha256', ooActiveSecret()).update(h + '.' + b).digest();
+  let sig;
+  try { sig = Buffer.from(s, 'base64url'); } catch (e) { return null; }
+  if (expected.length !== sig.length || !crypto.timingSafeEqual(expected, sig)) return null;
+  try { return JSON.parse(Buffer.from(b, 'base64url').toString('utf8')); } catch (e) { return null; }
+}
+
+function getDocType(ext) {
+  const map = {
+    '.docx': 'word', '.doc': 'word', '.odt': 'word', '.rtf': 'word', '.txt': 'word', '.md': 'word',
+    '.xlsx': 'cell', '.xls': 'cell', '.ods': 'cell', '.csv': 'cell',
+    '.pptx': 'slide', '.ppt': 'slide', '.odp': 'slide'
+  };
+  return map[ext.toLowerCase()] || 'word';
+}
+
+function isLocalHost(host) {
+  return /^(127\.0\.0\.1|localhost)(:|$)/i.test(host);
+}
+
+function publicProto(req) {
+  const p = req.headers['x-forwarded-proto'];
+  if (p) return p.split(',')[0].trim();
+  return isLocalHost(publicHost(req)) ? 'http' : 'https';
+}
+
+function publicHost(req) {
+  const h = req.headers['x-forwarded-host'];
+  if (h) return h.split(',')[0].trim();
+  return req.headers.host || ('127.0.0.1:' + PORT);
+}
+
+function swapPort(host, port) {
+  if (/:\d+$/.test(host)) return host.replace(/:\d+$/, ':' + port);
+  return host + ':' + port;
+}
+
+function docBase(req) {
+  if (PUBLIC_URL) return PUBLIC_URL;
+  const host = publicHost(req);
+  if (isLocalHost(host)) return 'http://host.docker.internal:' + PORT;
+  return publicProto(req) + '://' + host;
+}
+
+function streamFile(file, res) {
+  const st = fs.statSync(file);
+  res.setHeader('Content-Type', mime.lookup(file) || 'application/octet-stream');
+  res.setHeader('Content-Length', st.size);
+  fs.createReadStream(file).on('error', () => res.status(404).end()).pipe(res);
+}
+
+app.use(express.static(path.join(__dirname, '..', 'public')));
+
+app.get('/api/browse', async (req, res) => {
+  try {
+    const dir = safeResolve(req.query.path);
+    if (!isDir(dir)) return sendErr(res, 'フォルダではありません');
+    const entries = await fs.promises.readdir(dir, { withFileTypes: true });
+    const items = [];
+    for (const ent of entries) {
+      const full = path.join(dir, ent.name);
+      let st;
+      try { st = await fs.promises.stat(full); } catch (e) { continue; }
+      items.push({
+        name: ent.name,
+        path: toRel(full),
+        isDirectory: ent.isDirectory(),
+        size: ent.isDirectory() ? 0 : st.size,
+        extension: ent.isDirectory() ? '' : path.extname(ent.name).toLowerCase(),
+        modified: st.mtime.toISOString(),
+        hasChildren: ent.isDirectory() ? await hasChildren(full) : false
+      });
+    }
+    res.json({ success: true, items });
+  } catch (e) {
+    sendErr(res, e.message, e.status || 400);
+  }
+});
+
+app.get('/api/tree', async (req, res) => {
+  try {
+    const dir = safeResolve(req.query.path);
+    const entries = await fs.promises.readdir(dir, { withFileTypes: true });
+    const items = [];
+    for (const ent of entries) {
+      if (!ent.isDirectory()) continue;
+      const full = path.join(dir, ent.name);
+      items.push({ name: ent.name, path: toRel(full), hasChildren: await hasChildren(full) });
+    }
+    res.json({ success: true, items });
+  } catch (e) {
+    sendErr(res, e.message, e.status || 400);
+  }
+});
+
+app.get('/api/thumbnail', (req, res) => {
+  try {
+    const file = safeResolve(req.query.path);
+    const type = mime.lookup(file) || 'application/octet-stream';
+    if (!type.startsWith('image/')) return sendErr(res, '画像ではありません', 415);
+    res.setHeader('Content-Type', type);
+    fs.createReadStream(file).on('error', () => res.status(404).end()).pipe(res);
+  } catch (e) {
+    sendErr(res, e.message, e.status || 400);
+  }
+});
+
+app.get('/api/view', (req, res) => {
+  try {
+    const file = safeResolve(req.query.path);
+    if (isDir(file)) return sendErr(res, 'フォルダです');
+    res.setHeader('Content-Disposition', 'inline; filename="' + encodeURIComponent(path.basename(file)) + '"');
+    streamFile(file, res);
+  } catch (e) {
+    sendErr(res, e.message, e.status || 400);
+  }
+});
+
+app.get('/api/download', (req, res) => {
+  try {
+    const file = safeResolve(req.query.path);
+    if (isDir(file)) {
+      res.setHeader('Content-Type', 'application/zip');
+      res.setHeader('Content-Disposition', 'attachment; filename="' + encodeURIComponent(path.basename(file)) + '.zip"');
+      const archive = archiver('zip', { zlib: { level: 6 } });
+      archive.on('error', () => res.status(500).end());
+      archive.pipe(res);
+      archive.directory(file, path.basename(file));
+      archive.finalize();
+      return;
+    }
+    res.setHeader('Content-Disposition', 'attachment; filename="' + encodeURIComponent(path.basename(file)) + '"');
+    streamFile(file, res);
+  } catch (e) {
+    sendErr(res, e.message, e.status || 400);
+  }
+});
+
+app.post('/api/download-batch', (req, res) => {
+  const paths = Array.isArray(req.body.paths) ? req.body.paths : [];
+  res.setHeader('Content-Type', 'application/zip');
+  res.setHeader('Content-Disposition', 'attachment; filename="download.zip"');
+  const archive = archiver('zip', { zlib: { level: 6 } });
+  archive.on('error', () => res.status(500).end());
+  archive.pipe(res);
+  const seen = new Set();
+  for (const p of paths) {
+    try {
+      const abs = safeResolve(p);
+      const name = p || path.basename(abs);
+      if (seen.has(name)) continue;
+      seen.add(name);
+      if (isDir(abs)) archive.directory(abs, name);
+      else archive.file(abs, { name });
+    } catch (e) {}
+  }
+  archive.finalize();
+});
+
+app.post('/api/move', (req, res) => {
+  try {
+    const src = safeResolve(req.body.sourcePath);
+    const destDir = safeResolve(req.body.destPath);
+    if (!isDir(destDir)) return sendErr(res, '移動先がフォルダではありません');
+    const dest = path.join(destDir, path.basename(src));
+    if (src !== dest) fs.renameSync(src, dest);
+    res.json({ success: true });
+  } catch (e) {
+    sendErr(res, e.message, e.status || 400);
+  }
+});
+
+app.post('/api/move-batch', (req, res) => {
+  const paths = Array.isArray(req.body.paths) ? req.body.paths : [];
+  let destDir;
+  try { destDir = safeResolve(req.body.destPath); } catch (e) { return sendErr(res, e.message); }
+  const errors = [];
+  let moved = 0;
+  for (const p of paths) {
+    try {
+      const src = safeResolve(p);
+      const dest = path.join(destDir, path.basename(src));
+      if (src === dest) continue;
+      fs.renameSync(src, dest);
+      moved++;
+    } catch (e) {
+      errors.push({ path: p, error: e.message });
+    }
+  }
+  res.json({ success: true, moved, errors });
+});
+
+app.post('/api/delete', (req, res) => {
+  try {
+    const abs = safeResolve(req.body.path);
+    fs.rmSync(abs, { recursive: true, force: true });
+    res.json({ success: true });
+  } catch (e) {
+    sendErr(res, e.message, e.status || 400);
+  }
+});
+
+app.post('/api/delete-batch', (req, res) => {
+  const paths = Array.isArray(req.body.paths) ? req.body.paths : [];
+  for (const p of paths) {
+    try { fs.rmSync(safeResolve(p), { recursive: true, force: true }); } catch (e) {}
+  }
+  res.json({ success: true });
+});
+
+app.post('/api/rename', (req, res) => {
+  try {
+    const oldAbs = safeResolve(req.body.oldPath);
+    const newName = String(req.body.newName || '').trim();
+    if (!newName || newName.includes('/') || newName.includes('\\')) return sendErr(res, '名前が不正です');
+    const newAbs = path.join(path.dirname(oldAbs), newName);
+    if (fs.existsSync(newAbs)) return sendErr(res, '同じ名前のファイルが存在します');
+    fs.renameSync(oldAbs, newAbs);
+    res.json({ success: true });
+  } catch (e) {
+    sendErr(res, e.message, e.status || 400);
+  }
+});
+
+app.post('/api/mkdir', (req, res) => {
+  try {
+    const dir = safeResolve(req.body.path);
+    const name = String(req.body.name || '').trim();
+    if (!name || name.includes('/') || name.includes('\\')) return sendErr(res, '名前が不正です');
+    const target = path.join(dir, name);
+    if (fs.existsSync(target)) return sendErr(res, '同じ名前のフォルダが存在します');
+    fs.mkdirSync(target);
+    res.json({ success: true });
+  } catch (e) {
+    sendErr(res, e.message, e.status || 400);
+  }
+});
+
+app.post('/api/createfile', (req, res) => {
+  try {
+    const dir = safeResolve(req.body.path);
+    const name = String(req.body.name || '').trim();
+    const type = String(req.body.type || '.txt');
+    if (!name || name.includes('/') || name.includes('\\')) return sendErr(res, '名前が不正です');
+    const ext = type.startsWith('.') ? type : '.' + type;
+    const target = path.join(dir, name + ext);
+    if (fs.existsSync(target)) return sendErr(res, '同じ名前のファイルが存在します');
+    fs.writeFileSync(target, '');
+    res.json({ success: true });
+  } catch (e) {
+    sendErr(res, e.message, e.status || 400);
+  }
+});
+
+/* multer/busboy は multipart のファイル名を latin1 としてデコードするため、
+   日本語等のマルチバイト文字が文字化けする。UTF-8 に戻して復元する。
+   ただし既に正しい UTF-8 文字列の場合はそのまま返す（往復チェックで判定）。 */
+function decodeUploadName(name) {
+  const s = String(name || '');
+  try {
+    const d = Buffer.from(s, 'latin1').toString('utf8');
+    if (Buffer.from(d, 'utf8').toString('latin1') === s) return d;
+  } catch (e) {}
+  return s;
+}
+
+function sanitizeUploadSegment(s) {
+  const n = String(s || '').replace(/[\\:*?"<>|]/g, '_').trim();
+  if (!n || n === '.' || n === '..') return '';
+  return n;
+}
+
+/* multipart のファイル名に含まれる相対パス（フォルダアップロード時）を
+   取り出し、サニタイズした [dirSegments, baseName] を返す。
+   通常ファイルの場合は dirSegments が空になる。 */
+function parseUploadRel(originalname) {
+  const decoded = decodeUploadName(originalname);
+  const parts = String(decoded || '').split('/').map(p => p.trim()).filter(p => p !== '');
+  const segs = [];
+  for (const p of parts) {
+    if (p === '.' || p === '..') continue;
+    const s = sanitizeUploadSegment(p);
+    if (s) segs.push(s);
+  }
+  if (!segs.length) return { dirs: [], base: 'upload' };
+  return { dirs: segs.slice(0, -1), base: segs[segs.length - 1] };
+}
+
+function resolveUploadDir(base, dirs) {
+  let target = base;
+  for (const d of dirs) {
+    target = path.join(target, d);
+  }
+  const check = path.relative(base, target);
+  if (check === '..' || check.startsWith('..' + path.sep) || path.isAbsolute(check)) {
+    throw new Error('Invalid path');
+  }
+  fs.mkdirSync(target, { recursive: true });
+  return target;
+}
+
+/* フォルダアップロード用: クライアントは各ファイルの相対パスを
+   テキストフィールド paths（JSON 配列または複数フィールド）で送る。
+   busboy/multer が originalname のディレクトリ部分を落とすため。 */
+function uploadPathsOf(req) {
+  try {
+    const raw = req.body && req.body.paths;
+    if (Array.isArray(raw)) return raw.map(String);
+    if (typeof raw === 'string' && raw !== '') {
+      try {
+        const arr = JSON.parse(raw);
+        if (Array.isArray(arr)) return arr.map(String);
+      } catch (e) { return [raw]; }
+    }
+  } catch (e) {}
+  return [];
+}
+
+const uploader = multer({
+  storage: multer.diskStorage({
+    destination: (req, file, cb) => {
+      try {
+        const base = safeResolve(req.query.path);
+        if (!isDir(base)) return cb(new Error('アップロード先がフォルダではありません'));
+        /* ファイルと paths は送信順に対応する。destination→filename の順に
+           呼ばれるためキューで受け渡す。paths が無ければ originalname を使用。 */
+        const paths = uploadPathsOf(req);
+        const idx = req._uploadIdx || 0;
+        req._uploadIdx = idx + 1;
+        const src = idx < paths.length ? paths[idx] : file.originalname;
+        const rel = parseUploadRel(src);
+        req._uploadRels = req._uploadRels || [];
+        req._uploadRels.push(rel);
+        cb(null, resolveUploadDir(base, rel.dirs));
+      } catch (e) { cb(e); }
+    },
+    filename: (req, file, cb) => {
+      const rel = (req._uploadRels && req._uploadRels.shift()) || parseUploadRel(file.originalname);
+      cb(null, rel.base);
+    }
+  }),
+  limits: { fileSize: 2 * 1024 * 1024 * 1024 }
+});
+
+app.post('/api/upload', (req, res) => {
+  uploader.array('files')(req, res, (err) => {
+    if (err) return sendErr(res, err.message);
+    res.json({ success: true });
+  });
+});
+
+/* 空フォルダ等を再帰的に作成（フォルダアップロード時の D&D 走査用） */
+app.post('/api/mkdirp', (req, res) => {
+  try {
+    const base = safeResolve(req.body.path);
+    if (!isDir(base)) return sendErr(res, 'フォルダではありません');
+    const dirs = Array.isArray(req.body.dirs) ? req.body.dirs : [];
+    let created = 0;
+    for (const d of dirs) {
+      const raw = String(d || '').split('/');
+      if (raw.some(p => p.trim() === '..')) continue;
+      const parts = raw.map(p => p.trim())
+        .filter(p => p !== '' && p !== '.')
+        .map(sanitizeUploadSegment).filter(Boolean);
+      if (!parts.length) continue;
+      resolveUploadDir(base, parts);
+      created++;
+    }
+    res.json({ success: true, created });
+  } catch (e) {
+    sendErr(res, e.message, e.status || 400);
+  }
+});
+
+app.get('/api/info', (req, res) => {
+  try {
+    const abs = safeResolve(req.query.path);
+    const st = fs.statSync(abs);
+    res.json({ success: true, info: {
+      name: path.basename(abs),
+      path: toRel(abs),
+      isDirectory: st.isDirectory(),
+      size: st.size,
+      modified: st.mtime.toISOString(),
+      created: st.birthtime.toISOString(),
+      permissions: (st.mode & 0o777).toString(8)
+    }});
+  } catch (e) {
+    sendErr(res, e.message, e.status || 400);
+  }
+});
+
+app.get('/api/onlyoffice/config', (req, res) => {
+  try {
+    const filePath = String(req.query.path || '');
+    const abs = safeResolve(filePath);
+    if (!fs.existsSync(abs) || isDir(abs)) return sendErr(res, '編集できないファイルです');
+    const ext = path.extname(abs).toLowerCase();
+    const name = path.basename(abs);
+    const key = crypto.createHash('md5').update(filePath + ':' + fs.statSync(abs).mtimeMs).digest('hex');
+    const proto = publicProto(req);
+    const host = publicHost(req);
+    const editorUrl = ONLYOFFICE_URL || (proto + '://' + swapPort(host, OO_PORT));
+    const base = docBase(req);
+    const config = {
+      document: {
+        fileType: ext.replace('.', ''),
+        key,
+        title: name,
+        url: base + '/api/view?path=' + encodeURIComponent(filePath),
+        permissions: { edit: true, download: true, print: true }
+      },
+      editorConfig: {
+        mode: 'edit',
+        lang: 'ja-JP',
+        callbackUrl: base + '/api/onlyoffice/callback?path=' + encodeURIComponent(filePath)
+      },
+      documentType: getDocType(ext)
+    };
+    if (ooActiveSecret()) config.token = signJwt(config);
+    res.json({ success: true, editorUrl, config });
+  } catch (e) {
+    sendErr(res, e.message, e.status || 400);
+  }
+});
+
+app.post('/api/onlyoffice/callback', async (req, res) => {
+  try {
+    const body = req.body || {};
+    if (ooActiveSecret() && !verifyJwt(body.token)) {
+      return res.json({ error: 1 });
+    }
+    if (body.status === 2 && body.url) {
+      const abs = safeResolve(req.query.path);
+      const resp = await fetch(body.url);
+      if (!resp.ok) return res.json({ error: 1 });
+      const data = Buffer.from(await resp.arrayBuffer());
+      await fs.promises.writeFile(abs, data);
+    }
+    res.json({ error: 0 });
+  } catch (e) {
+    res.json({ error: 1 });
+  }
+});
+
+let ooInstalling = false;
+
+app.get('/api/onlyoffice/status', async (req, res) => {
+  try {
+    const installed = fs.existsSync(OO_COMPOSE_FILE);
+    const running = installed ? await ooContainerRunning() : false;
+    const healthy = running ? await ooHealthy() : false;
+    let docker = false;
+    try { await sh('docker', ['version', '--format', 'ok'], { timeout: 10000 }); docker = true; } catch (e) {}
+    const env = await ooEnvCheck();
+    res.json({ success: true, installed, running, healthy, docker, port: OO_PORT, editorUrl: ooEditorUrl(req), installing: ooInstalling, env });
+  } catch (e) {
+    sendErr(res, e.message, e.status || 500);
+  }
+});
+
+app.get('/api/onlyoffice/install', (req, res) => {
+  if (ooInstalling) return sendErr(res, 'セットアップがすでに進行中です', 409);
+  ooInstalling = true;
+  res.writeHead(200, {
+    'Content-Type': 'text/event-stream',
+    'Cache-Control': 'no-cache',
+    Connection: 'keep-alive',
+    'X-Accel-Buffering': 'no'
+  });
+  const send = (event, data) => res.write('event: ' + event + '\ndata: ' + JSON.stringify(data) + '\n\n');
+  const log = m => send('log', { message: m });
+
+  (async () => {
+    let needRestart = false;
+    let reused = false;
+    try {
+      log('OnlyOffice Document Server のセットアップを開始します');
+
+      // ── 実行環境チェック（LXD コンテナ / Nesting） ──
+      log('実行環境を確認中...');
+      const envCheck = await ooEnvCheck();
+      if (envCheck.isLxc && !envCheck.nestingOk) {
+        const cname = envCheck.containerName || '<コンテナ名>';
+        log('LXD コンテナ「' + cname + '」内で Nesting が無効のため、このままでは Docker を起動できません');
+        const fix = await ooTryEnableNesting(envCheck.containerName);
+        if (fix.result === 'set') {
+          log('security.nesting=true を設定しました。反映にはコンテナ再起動が必要です');
+          send('warning', {
+            title: 'security.nesting を有効にしました',
+            lines: ['設定の反映にはコンテナの再起動が必要です。ホスト側で次のコマンドを実行してください:'],
+            command: 'lxc restart ' + cname,
+            after: '再起動後、ページを再読み込みしてもう一度インストールを実行してください'
+          });
+        } else {
+          send('warning', {
+            title: 'LXD コンテナの Nesting を有効にしてください',
+            lines: [
+              'この環境は LXD コンテナ内で、Nesting が無効のため Docker を起動できません。',
+              'ホスト' + (envCheck.hostName ? '（' + envCheck.hostName + '）' : '') + '側で次のコマンドを実行してください:'
+            ],
+            command: 'lxc config set ' + cname + ' security.nesting true\nlxc restart ' + cname,
+            after: '再起動後、ページを再読み込みしてもう一度インストールを実行してください'
+          });
+        }
+        send('done', { ok: false, error: fix.result === 'set' ? 'コンテナ再起動後に再度実行してください' : 'Nesting を有効にしてから再度実行してください', blocked: 'nesting' });
+        return;
+      }
+      log(envCheck.isLxc
+        ? 'LXD コンテナ内を検出 (' + (envCheck.containerName || '名称不明') + ') - Docker の動作に問題なし。続行します'
+        : '実行環境: ' + (envCheck.virt === 'none' ? 'ネイティブ (VM/物理)' : envCheck.virt));
+
+      // ── Docker の確認・インストール ──
+      let dockerOk = false;
+      try { await sh('docker', ['version', '--format', 'ok'], { timeout: 10000 }); dockerOk = true; } catch (e) {}
+      if (!dockerOk) {
+        log('Docker が見つかりません。インストール中...（数分かかります）');
+        await sh('bash', ['-c', 'curl -fsSL https://get.docker.com | sh'], { timeout: 900000 });
+        await sh('systemctl', ['enable', '--now', 'docker'], { timeout: 60000 }).catch(() => {});
+        if (!(await ooDockerDaemonReady(60000))) throw new Error('Docker デーモンの起動に失敗しました');
+        log('Docker のインストールが完了しました');
+      }
+
+      // ── シークレットの決定（既存環境は再利用） ──
+      let secret = '';
+      if (fs.existsSync(OO_COMPOSE_FILE)) {
+        reused = true;
+        log('既存の OnlyOffice 環境 (/opt/onlyoffice) を検出しました。再利用します');
+        secret = ooReadComposeSecret();
+        if (!secret) {
+          log('既存のシークレットキーを取得できなかったため、新規に生成します');
+          secret = crypto.randomBytes(32).toString('hex');
+          reused = false;
+        }
+      } else {
+        secret = crypto.randomBytes(32).toString('hex');
+      }
+
+      // ── docker-compose.yml の生成 ──
+      if (!reused) {
+        log('OnlyOffice のディレクトリを作成...');
+        fs.mkdirSync(path.join(OO_DIR, 'logs'), { recursive: true });
+        fs.mkdirSync(path.join(OO_DIR, 'data'), { recursive: true });
+        fs.mkdirSync(path.join(OO_DIR, 'lib'), { recursive: true });
+        const composeYml = [
+          '# OnlyOffice Document Server for selfEx',
+          '# Generated: ' + new Date().toISOString(),
+          '',
+          'services:',
+          '  onlyoffice:',
+          '    image: onlyoffice/documentserver:latest',
+          '    container_name: onlyoffice',
+          '    restart: unless-stopped',
+          '    ports:',
+          '      - "127.0.0.1:' + OO_PORT + ':80"',
+          '    environment:',
+          '      JWT_ENABLED: "true"',
+          '      JWT_SECRET: "' + secret + '"',
+          '    extra_hosts:',
+          '      - "host.docker.internal:host-gateway"',
+          '    volumes:',
+          '      - /opt/onlyoffice/logs:/var/log/onlyoffice',
+          '      - /opt/onlyoffice/data:/var/www/onlyoffice/Data',
+          '      - /opt/onlyoffice/lib:/var/lib/onlyoffice',
+          ''
+        ].join('\n');
+        fs.writeFileSync(OO_COMPOSE_FILE, composeYml);
+        log('docker-compose.yml を生成しました');
+      }
+
+      // ── server.js のシークレットを同期 ──
+      if (ooCurrentServerSecret() !== secret) {
+        log('selfEx 側のシークレットキーを更新します');
+        ooSetServerSecret(secret);
+        needRestart = true;
+      }
+
+      // ── コンテナ起動 ──
+      const compose = await ooComposeCommand();
+      if (!reused) {
+        log('OnlyOffice イメージをダウンロード中...（初回は数分かかります）');
+        await sh(compose.cmd, compose.baseArgs.concat(['pull']), { timeout: 1800000, cwd: OO_DIR });
+      } else {
+        await sh(compose.cmd, compose.baseArgs.concat(['pull']), { timeout: 1800000, cwd: OO_DIR }).catch(() => {});
+      }
+      log('OnlyOffice コンテナを起動中...');
+      await sh(compose.cmd, compose.baseArgs.concat(['up', '-d']), { timeout: 600000, cwd: OO_DIR });
+      send('progress', { message: 'コンテナを起動しました' });
+
+      // ── Tailscale Serve 設定 ──
+      try {
+        await sh('tailscale', ['version'], { timeout: 10000 });
+        const serveStatus = (await sh('tailscale', ['serve', 'status'], { timeout: 15000 })).stdout;
+        if (new RegExp(':' + OO_PORT + '(\\b|$)').test(serveStatus)) {
+          log('ポート ' + OO_PORT + ' はすでに Tailscale Serve に登録されています');
+        } else {
+          log('Tailscale Serve にポート ' + OO_PORT + ' を追加...');
+          await sh('tailscale', ['serve', '--bg', '--https=' + OO_PORT, 'http://127.0.0.1:' + OO_PORT], { timeout: 30000 });
+          log('Tailscale Serve の設定を追加しました');
+        }
+      } catch (e) {}
+
+      // ── 起動待ち（healthcheck） ──
+      log('Document Server の起動を待機中...（初回は2〜3分かかります）');
+      const deadline = Date.now() + 420000;
+      let waited = 0;
+      while (Date.now() < deadline) {
+        if (await ooHealthy()) break;
+        await new Promise(r => setTimeout(r, 5000));
+        waited += 5;
+        if (waited % 20 === 0) send('progress', { message: '起動を待機中... (' + waited + '秒経過)' });
+      }
+
+      const healthy = await ooHealthy();
+      if (healthy) log('OnlyOffice Document Server が起動しました！');
+      else log('警告: タイムアウトまでに起動が確認できませんでした。後ほど「再チェック」をお試しください');
+
+      send('done', { ok: true, healthy, reused, needRestart, editorUrl: ooEditorUrl(req) });
+      if (needRestart) {
+        setTimeout(() => { sh('systemctl', ['restart', OO_SERVICE_NAME]).catch(() => {}); }, 1500);
+      }
+    } catch (e) {
+      send('done', { ok: false, error: e.message || String(e) });
+    } finally {
+      ooInstalling = false;
+    }
+  })();
+});
+
+app.get('/api/fonts/status', async (req, res) => {
+  try {
+    const dirExists = ffDirExists();
+    const fontCount = dirExists ? ffCountFonts() : 0;
+    let containerRunning = false;
+    if (fs.existsSync(OO_COMPOSE_FILE)) containerRunning = await ooContainerRunning();
+    res.json({
+      success: true,
+      dirExists,
+      fontCount,
+      mounted: ffMounted(),
+      onlyOfficeRunning: containerRunning,
+      busy: ffInstalling,
+      relPath: toRel(FONT_DIR),
+      absPath: FONT_DIR
+    });
+  } catch (e) {
+    sendErr(res, e.message, e.status || 500);
+  }
+});
+
+app.post('/api/fonts/createdir', (req, res) => {
+  try {
+    fs.mkdirSync(FONT_DIR, { recursive: true });
+    res.json({ success: true, relPath: toRel(FONT_DIR) });
+  } catch (e) {
+    sendErr(res, e.message, e.status || 500);
+  }
+});
+
+app.get('/api/fonts/add', (req, res) => {
+  if (ffInstalling) return sendErr(res, 'フォント処理がすでに進行中です', 409);
+  if (!fs.existsSync(FF_SCRIPT)) return sendErr(res, 'add-fonts.sh が見つかりません', 500);
+  if (!ffDirExists()) return sendErr(res, 'Fonts フォルダがありません。先に作成してください', 400);
+  const n = ffCountFonts();
+  if (n === 0) return sendErr(res, 'フォントファイル（ttf/otf/woff/woff2）が Fonts フォルダにありません', 400);
+  if (!fs.existsSync(OO_COMPOSE_FILE)) return sendErr(res, 'OnlyOffice が未セットアップです。先に OnlyOffice をインストールしてください', 400);
+  ffInstalling = true;
+  res.writeHead(200, {
+    'Content-Type': 'text/event-stream',
+    'Cache-Control': 'no-cache',
+    Connection: 'keep-alive',
+    'X-Accel-Buffering': 'no'
+  });
+  const send = (event, data) => res.write('event: ' + event + '\ndata: ' + JSON.stringify(data) + '\n\n');
+  const log = m => send('log', { message: m });
+
+  log('add-fonts.sh を実行します（フォント ' + n + ' 件を検出）');
+  const child = spawn('bash', [FF_SCRIPT], { cwd: path.dirname(FF_SCRIPT) });
+  let buf = '';
+  const pump = d => {
+    buf += d.toString().replace(/\r\n/g, '\n').replace(/\r/g, '\n');
+    let i;
+    while ((i = buf.indexOf('\n')) >= 0) {
+      const line = buf.slice(0, i); buf = buf.slice(i + 1);
+      const clean = line.replace(/\x1b\[[0-9;]*m/g, '');
+      if (clean.trim()) log(clean);
+    }
+  };
+  child.stdout.on('data', pump);
+  child.stderr.on('data', pump);
+  child.on('close', code => {
+    send('done', { ok: code === 0, code, fontCount: n });
+    ffInstalling = false;
+  });
+  child.on('error', err => {
+    send('done', { ok: false, error: err.message || String(err) });
+    ffInstalling = false;
+  });
+});
+
+/* ── バージョン / アップデート / 再起動 ── */
+app.get('/api/version', async (req, res) => {
+  try {
+    let commit = '';
+    try { commit = (await sh('git', ['rev-parse', '--short', 'HEAD'], { cwd: path.join(__dirname, '..') })).stdout.trim(); } catch (e) {}
+    res.json({ success: true, version: PKG.version, commit });
+  } catch (e) {
+    sendErr(res, e.message, e.status || 500);
+  }
+});
+
+let upUpdating = false;
+/* server.js.template の変更を、実行中の server.js に再生成して反映する。
+   server/server.js はシークレットを含むため git 管理対象外で、
+   git pull で更新されるのは server.js.template のみ。
+   インストール時と同じ置換（PORT / OO_PORT / ROOT_DIR / OO_SECRET）を、
+   現在の設定値（既存 server.js から抽出）を保持したまま再適用する。 */
+function regenerateServerFromTemplate() {
+  const tpl = path.join(__dirname, 'server.js.template');
+  const out = path.join(__dirname, 'server.js');
+  let cur = '';
+  try { cur = fs.readFileSync(out, 'utf8'); } catch (e) {}
+  const grab = re => { const m = cur.match(re); return m ? m[1] : ''; };
+  const port      = grab(/process\.env\.PORT \|\| '([^']*)'/)        || process.env.PORT || '3362';
+  const ooPort    = grab(/process\.env\.ONLYOFFICE_PORT \|\| '([^']*)'/) || process.env.ONLYOFFICE_PORT || '3322';
+  const rootDir   = grab(/process\.env\.ROOT_DIR \|\| '([^']*)'/)    || process.env.ROOT_DIR || '/';
+  const secret    = ooCurrentServerSecret();
+  let src;
+  try { src = fs.readFileSync(tpl, 'utf8'); } catch (e) { return false; }
+  /* プレースホルダトークン(例: アンダースコア2つ+PORT+アンダースコア2つ)は文字列連結で構成する。
+     インストール時のグローバル sed で関数内の
+     リテラル文字列が書き換えられるのを防ぐため。 */
+  const tok = k => '_' + '_' + k + '_' + '_';
+  src = src.split(tok('PORT')).join(port)
+           .split(tok('OO_PORT')).join(ooPort)
+           .split(tok('ROOT_DIR')).join(rootDir)
+           .split(tok('OO_SECRET')).join(secret);
+  try {
+    fs.writeFileSync(out, src);
+    return true;
+  } catch (e) { return false; }
+}
+
+app.get('/api/update', (req, res) => {
+  if (upUpdating) return sendErr(res, 'アップデートがすでに進行中です', 409);
+  upUpdating = true;
+  res.writeHead(200, {
+    'Content-Type': 'text/event-stream',
+    'Cache-Control': 'no-cache',
+    Connection: 'keep-alive',
+    'X-Accel-Buffering': 'no'
+  });
+  const send = (event, data) => res.write('event: ' + event + '\ndata: ' + JSON.stringify(data) + '\n\n');
+  const log = m => send('log', { message: m });
+  const repoDir = path.join(__dirname, '..');
+  (async () => {
+    let oldHead = '';
+    try { oldHead = (await sh('git', ['rev-parse', 'HEAD'], { cwd: repoDir })).stdout.trim(); } catch (e) {}
+    log('GitHub から最新版を取得します (git pull --ff-only)');
+    /* 旧インストーラが public/js/app.js の ROOT_PREFIX を sed 書き換えしていた環境では
+       git pull がローカル変更で失敗するため、設定差分のみを事前に破棄して回復させる。
+       v1.4.0 以降は /api/config で取得するため書き換えは不要。 */
+    try {
+      await sh('git', ['checkout', '--', 'public/js/app.js'], { cwd: repoDir, timeout: 20000 });
+    } catch (e) {}
+    const child = spawn('git', ['pull', '--ff-only'], { cwd: repoDir });
+    let buf = '';
+    const pump = d => {
+      buf += d.toString().replace(/\r\n/g, '\n').replace(/\r/g, '\n');
+      let i;
+      while ((i = buf.indexOf('\n')) >= 0) {
+        const line = buf.slice(0, i); buf = buf.slice(i + 1);
+        if (line.trim()) log(line);
+      }
+    };
+    child.stdout.on('data', pump);
+    child.stderr.on('data', pump);
+    child.on('close', async code => {
+      if (code !== 0) { send('done', { ok: false, error: 'git pull 失敗 (code ' + code + ')。ローカルの変更を確認してください' }); upUpdating = false; return; }
+      let changed = [];
+      try {
+        changed = (await sh('git', ['diff', '--name-only', oldHead + '..HEAD'], { cwd: repoDir })).stdout.split('\n').filter(Boolean);
+      } catch (e) {}
+      const serverChanged = changed.some(f => f.startsWith('server/'));
+      if (serverChanged) {
+        log('サーバー側の変更があります。server.js を再生成します...');
+        regenerateServerFromTemplate();
+      }
+      const needRestart = serverChanged;
+      log(changed.length ? '更新ファイル: ' + changed.length + ' 件' : '更新はありません');
+      if (needRestart) log('サーバー側の変更があるため「再起動」が必要です');
+      send('done', { ok: true, changedFiles: changed.length, needRestart });
+      upUpdating = false;
+    });
+    child.on('error', err => {
+      send('done', { ok: false, error: err.message || String(err) });
+      upUpdating = false;
+    });
+  })();
+});
+
+app.post('/api/restart', (req, res) => {
+  res.json({ success: true, restarting: true });
+  setTimeout(() => {
+    regenerateServerFromTemplate();
+    sh('systemctl', ['restart', OO_SERVICE_NAME]).catch(e => console.error('restart failed:', e.message));
+  }, 300);
+});
+
+/* ── Web サーバ（公開フォルダ） ── */
+const WEB_SERVE_PORT = WEB_PORT;
+
+let webServer = null;
+let webFolder = '';
+let webServerStarting = false;
+let webStaticMid = express.static(path.join(ROOT_DIR, 'nonexistent'));
+
+const webExpress = express();
+
+function refreshWebStatic() {
+  webStaticMid = express.static(path.join(ROOT_DIR, webFolder), { fallthrough: true });
+}
+
+/* /_status は認証なしのヘルスチェック用。静的配信ミドルウェアより先に登録する
+  （後に登録すると稼働中はフォルダ prefix チェックで 404 になってしまう）。 */
+webExpress.get('/_status', (req, res) => {
+  res.json({ running: !!webFolder && !!webServer, folder: webFolder, port: WEB_SERVE_PORT });
+});
+
+function webSafeAbs(folder, rel) {
+  const abs = path.resolve(ROOT_DIR, folder, rel || '');
+  const base = path.resolve(ROOT_DIR, folder);
+  if (abs !== base && !abs.startsWith(base + path.sep)) return null;
+  return abs;
+}
+
+webExpress.use((req, res, next) => {
+  if (!webFolder) return res.status(503).send('Web server is not running');
+  const folder = webFolder;
+  let p = req.path;
+  if (p === '/') p = '/' + folder + '/';
+  if (p === '/' + folder) p = '/' + folder + '/';
+  if (!p.startsWith('/' + folder + '/')) return res.status(404).send('Not found');
+  /* req.path は Express がデコード済みのため decodeURIComponent しない
+    （二重デコードするとファイル名の % で URIError になる）。 */
+  const rel = p.slice(folder.length + 2);
+  const abs = webSafeAbs(folder, rel);
+  if (!abs) return res.status(403).send('Forbidden');
+  const q = req.url.indexOf('?');
+  const qs = q >= 0 ? req.url.slice(q) : '';
+  try {
+    if (fs.statSync(abs).isDirectory()) {
+      if (fs.existsSync(path.join(abs, 'index.html'))) {
+        req.url = '/' + (rel ? rel.replace(/\/+$/, '') + '/' : '') + 'index.html' + qs;
+        return webStaticMid(req, res, next);
+      }
+      return sendWebListing(res, folder, rel);
+    }
+  } catch (e) {}
+  req.url = '/' + rel + qs;
+  return webStaticMid(req, res, next);
+});
+
+function sendWebListing(res, folder, rel) {
+  const abs = webSafeAbs(folder, rel);
+  if (!abs) return res.status(403).send('Forbidden');
+  let entries;
+  try {
+    entries = fs.readdirSync(abs, { withFileTypes: true });
+  } catch (e) {
+    return res.status(404).send('Not found');
+  }
+  entries.sort((a, b) => {
+    if (a.isDirectory() !== b.isDirectory()) return a.isDirectory() ? -1 : 1;
+    return a.name.localeCompare(b.name, 'ja');
+  });
+  const relPath = rel ? ('/' + folder + '/' + rel.replace(/\/+$/, '')) : ('/' + folder);
+  const parentHref = rel && rel.replace(/\/+$/, '')
+    ? encodeURI('/' + folder + '/' + rel.replace(/\/+$/, '').split('/').slice(0, -1).join('/')).replace(/\/$/, '') + '/'
+    : '/';
+  const rows = [];
+  rows.push('<tr><td><a href="' + parentHref + '">..</a></td><td></td><td></td></tr>');
+  for (const e of entries) {
+    let size = '';
+    if (!e.isDirectory()) {
+      try { size = formatWebSize(fs.statSync(path.join(abs, e.name)).size); } catch (err) {}
+    }
+    rows.push('<tr><td><a href="' + encodeURI(e.name) + (e.isDirectory() ? '/' : '') + '">' +
+      (e.isDirectory() ? '📁 ' : '📄 ') + escapeHtml(e.name) + '</a></td><td class="sz">' + (e.isDirectory() ? '-' : size) + '</td></tr>');
+  }
+  const html = '<!DOCTYPE html><html lang="ja"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Index of ' + escapeHtml(relPath) + '</title><style>body{font-family:system-ui,sans-serif;margin:40px auto;max-width:800px;padding:0 16px;color:#222}a{color:#0b5cad;text-decoration:none}a:hover{text-decoration:underline}table{width:100%;border-collapse:collapse}td{padding:6px 10px;border-bottom:1px solid #eee}td.sz{text-align:right;color:#666;white-space:nowrap}h1{font-size:18px;font-weight:600}</style></head><body><h1>Index of ' + escapeHtml(relPath) + '</h1><table>' + rows.join('') + '</table></body></html>';
+  res.setHeader('Content-Type', 'text/html; charset=utf-8');
+  return res.send(html);
+}
+
+function formatWebSize(b) {
+  if (b < 1024) return b + ' B';
+  const k = 1024, s = ['KB', 'MB', 'GB', 'TB', 'PB', 'EB'], i = Math.min(Math.floor(Math.log(b) / Math.log(k)) - 1, s.length - 1);
+  return (b / Math.pow(k, i + 1)).toFixed(1) + ' ' + s[Math.max(i, 0)];
+}
+
+function escapeHtml(s) {
+  return String(s).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+}
+
+/* フロントエンドの表示用設定（ROOT_PREFIX を sed 書き換えなしで取得させる） */
+app.get('/api/config', (req, res) => {
+  res.json({ success: true, rootPrefix: ROOT_DIR });
+});
+
+async function tailnetHostname() {
+  try {
+    const out = (await sh('tailscale', ['whoami', '--json'], { timeout: 10000 })).stdout;
+    const j = JSON.parse(out);
+    if (j && j.Node && j.Node.Name) return j.Node.Name.replace(/\.$/, '');
+  } catch (e) {}
+  try {
+    const j = JSON.parse((await sh('tailscale', ['status', '--self', '--json'], { timeout: 10000 })).stdout);
+    if (j && j.Self && j.Self.DNSName) return j.Self.DNSName.replace(/\.$/, '');
+  } catch (e) {}
+  return '';
+}
+
+async function startWebServer(folder) {
+  if (webServerStarting) throw new Error('すでに処理中です');
+  if (webServer && webFolder === folder) return null;
+  if (webServer && webFolder !== folder) {
+    await stopWebServer();
+  }
+  const abs = path.join(ROOT_DIR, folder);
+  if (!fs.existsSync(abs) || !fs.statSync(abs).isDirectory()) {
+    throw new Error('公開するフォルダが見つかりません: ' + folder);
+  }
+  webServerStarting = true;
+  try {
+    webFolder = folder;
+    refreshWebStatic();
+    if (!webServer) {
+      const srv = http.createServer(webExpress);
+      await new Promise((resolve, reject) => {
+        srv.once('error', reject);
+        srv.listen(WEB_SERVE_PORT, '127.0.0.1', resolve);
+      });
+      webServer = srv;
+    }
+    // Tailscale Serve で 3358 を公開
+    const serveStatus = (await sh('tailscale', ['serve', 'status'], { timeout: 15000 }).catch(() => ({ stdout: '' }))).stdout || '';
+    if (new RegExp(':' + WEB_SERVE_PORT + '(\\b|$)').test(serveStatus)) {
+      // 既に登録済みなら設定を付け替え
+      await sh('tailscale', ['serve', '--https=' + WEB_SERVE_PORT, 'off'], { timeout: 20000 }).catch(() => {});
+    }
+    await sh('tailscale', ['serve', '--bg', '--https=' + WEB_SERVE_PORT, 'http://127.0.0.1:' + WEB_SERVE_PORT], { timeout: 30000 });
+    try { webWriteSaved(folder, webReadSaved().autostart); } catch (e) {}
+    return { folder, port: WEB_SERVE_PORT };
+  } catch (e) {
+    webFolder = '';
+    throw e;
+  } finally {
+    webServerStarting = false;
+  }
+}
+
+async function stopWebServer() {
+  if (webServerStarting) throw new Error('すでに処理中です');
+  webFolder = '';
+  if (webServer) {
+    const srv = webServer;
+    webServer = null;
+    await new Promise(resolve => srv.close(() => resolve()));
+  }
+  await sh('tailscale', ['serve', '--https=' + WEB_SERVE_PORT, 'off'], { timeout: 20000 }).catch(() => {});
+  return true;
+}
+
+/* ── Web サーバの自動起動（状態ファイル） ── */
+const WEB_STATE_FILE = '/var/lib/selfex/webserver.json';
+
+function webReadSaved() {
+  try {
+    const j = JSON.parse(fs.readFileSync(WEB_STATE_FILE, 'utf8'));
+    if (j && typeof j === 'object') return { folder: j.folder || '', autostart: j.autostart !== false };
+  } catch (e) {}
+  return { folder: '', autostart: true };
+}
+
+function webWriteSaved(folder, autostart) {
+  try { fs.mkdirSync(path.dirname(WEB_STATE_FILE), { recursive: true }); } catch (e) {}
+  fs.writeFileSync(WEB_STATE_FILE, JSON.stringify({ folder: folder || '', autostart: autostart !== false }, null, 2));
+}
+
+app.get('/api/webserver/folders', (req, res) => {
+  try {
+    const dirs = [];
+    for (const ent of fs.readdirSync(ROOT_DIR, { withFileTypes: true })) {
+      if (ent.isDirectory()) dirs.push(ent.name);
+    }
+    dirs.sort((a, b) => a.localeCompare(b, 'ja'));
+    res.json({ success: true, folders: dirs });
+  } catch (e) {
+    sendErr(res, e.message, e.status || 500);
+  }
+});
+
+app.get('/api/webserver/status', async (req, res) => {
+  try {
+    const host = await tailnetHostname();
+    const tailnetBase = host ? ('https://' + host + ':' + WEB_SERVE_PORT) : '';
+    const saved = webReadSaved();
+    res.json({
+      success: true,
+      running: !!webFolder && !!webServer,
+      folder: webFolder,
+      port: WEB_SERVE_PORT,
+      tailnetBase,
+      starting: webServerStarting,
+      savedFolder: saved.folder,
+      autostart: saved.autostart
+    });
+  } catch (e) {
+    sendErr(res, e.message, e.status || 500);
+  }
+});
+
+app.post('/api/webserver/start', async (req, res) => {
+  try {
+    const folder = String((req.body && req.body.folder) || '').trim();
+    if (!folder) return sendErr(res, '公開するフォルダを選択してください');
+    if (folder.includes('/') || folder.includes('\\') || folder === '.' || folder === '..') {
+      return sendErr(res, 'フォルダ名が不正です');
+    }
+    const r = await startWebServer(folder);
+    res.json({ success: true, folder, port: WEB_SERVE_PORT, started: !!r });
+  } catch (e) {
+    sendErr(res, e.message, e.status || 500);
+  }
+});
+
+app.post('/api/webserver/stop', async (req, res) => {
+  try {
+    await stopWebServer();
+    res.json({ success: true });
+  } catch (e) {
+    sendErr(res, e.message, e.status || 500);
+  }
+});
+
+app.post('/api/webserver/autostart', (req, res) => {
+  try {
+    const on = !(req.body && req.body.enabled === false);
+    const saved = webReadSaved();
+    webWriteSaved(webFolder || saved.folder, on);
+    res.json({ success: true, autostart: on });
+  } catch (e) {
+    sendErr(res, e.message, e.status || 500);
+  }
+});
+
+/* ── Samba（Windows ファイル共有） ── */
+const SMB_CONF = '/etc/samba/smb.conf';
+const SMB_MANAGED_CONF = '/etc/samba/selfex.conf';
+const SMB_STATE_FILE = '/etc/samba/selfex.json';
+let smbInstalling = false;
+let smbBusy = false;
+
+function smbIsInstalled() {
+  try {
+    if (fs.existsSync('/usr/sbin/smbd') || fs.existsSync('/usr/bin/smbd')) return true;
+  } catch (e) {}
+  return false;
+}
+
+async function smbDaemonActive() {
+  try {
+    await sh('systemctl', ['is-active', '--quiet', 'smbd'], { timeout: 10000 });
+    return true;
+  } catch (e) {}
+  try {
+    const r = await sh('pgrep', ['smbd'], { timeout: 10000 });
+    return r.stdout.trim().length > 0;
+  } catch (e) {}
+  return false;
+}
+
+async function smbAutostartEnabled() {
+  try {
+    const r = await sh('systemctl', ['is-enabled', 'smbd'], { timeout: 10000 });
+    return r.stdout.trim() === 'enabled';
+  } catch (e) {
+    if (e && e.stdout && String(e.stdout).trim() === 'enabled') return true;
+  }
+  return false;
+}
+
+function smbReadState() {
+  try {
+    const j = JSON.parse(fs.readFileSync(SMB_STATE_FILE, 'utf8'));
+    if (j && typeof j === 'object') return j;
+  } catch (e) {}
+  return null;
+}
+
+function smbWriteState(s) {
+  try { fs.mkdirSync(path.dirname(SMB_STATE_FILE), { recursive: true }); } catch (e) {}
+  fs.writeFileSync(SMB_STATE_FILE, JSON.stringify(s, null, 2), { mode: 0o600 });
+}
+
+function smbManagedContent() {
+  try { return fs.readFileSync(SMB_MANAGED_CONF, 'utf8'); } catch (e) { return ''; }
+}
+
+function smbShareBlock(share, absPath, username, guestOk, readonly, forceUser) {
+  const lines = [
+    '# Generated by selfEx - DO NOT EDIT',
+    '# ' + new Date().toISOString(),
+    '',
+    '[global]',
+    '  map to guest = Bad User',
+    '  guest account = nobody',
+    '',
+    '[' + share + ']',
+    '  path = ' + absPath,
+    '  browseable = yes',
+    '  guest ok = ' + (guestOk ? 'yes' : 'no'),
+    '  read only = ' + (readonly ? 'yes' : 'no'),
+    '  create mask = 0644',
+    '  directory mask = 0755'
+  ];
+  if (forceUser) lines.push('  force user = ' + forceUser);
+  if (!guestOk && username) lines.push('  valid users = ' + username);
+  lines.push('');
+  return lines.join('\n');
+}
+
+async function smbOwnerName(absPath) {
+  try {
+    const st = fs.statSync(absPath);
+    const r = await sh('id', ['-nu', String(st.uid)], { timeout: 10000 });
+    const name = r.stdout.trim();
+    if (name) return name;
+  } catch (e) {}
+  return 'root';
+}
+
+async function smbSambaUserExists(username) {
+  try {
+    const r = await sh('pdbedit', ['-L'], { timeout: 15000 });
+    return r.stdout.split('\n').some(l => l.split(':')[0] === username);
+  } catch (e) { return false; }
+}
+
+async function smbEnsureSystemUser(username) {
+  try {
+    await sh('id', [username], { timeout: 10000 });
+    return;
+  } catch (e) {}
+  await sh('useradd', ['-M', '-s', '/usr/sbin/nologin', username], { timeout: 30000 });
+}
+
+function smbSetPassword(username, password) {
+  return new Promise((resolve, reject) => {
+    const child = spawn('smbpasswd', ['-a', '-s', username]);
+    let stderr = '';
+    child.stderr.on('data', d => { stderr += d.toString(); });
+    child.on('error', reject);
+    child.on('close', code => {
+      if (code !== 0) return reject(new Error('smbpasswd 失敗 (code ' + code + '): ' + stderr.trim()));
+      spawn('smbpasswd', ['-e', username]).on('close', () => resolve());
+    });
+    child.stdin.write(password + '\n');
+    child.stdin.write(password + '\n');
+    child.stdin.end();
+  });
+}
+
+async function smbReload() {
+  try {
+    await sh('smbcontrol', ['all', 'reload-config'], { timeout: 30000 });
+    return;
+  } catch (e) {}
+  try {
+    await sh('systemctl', ['reload', 'smbd'], { timeout: 30000 });
+    return;
+  } catch (e) {}
+  await sh('systemctl', ['restart', 'smbd'], { timeout: 60000 });
+}
+
+function smbEnsureInclude() {
+  let main = '';
+  try { main = fs.readFileSync(SMB_CONF, 'utf8'); } catch (e) {
+    throw new Error('smb.conf が見つかりません: ' + SMB_CONF);
+  }
+  if (!main.includes('selfex.conf')) {
+    fs.appendFileSync(SMB_CONF, '\n# Added by selfEx\ninclude = ' + SMB_MANAGED_CONF + '\n');
+  }
+}
+
+async function smbServerIps() {
+  try {
+    const r = await sh('hostname', ['-I'], { timeout: 10000 });
+    return r.stdout.split(/\s+/).map(s => s.trim()).filter(s => s && !s.startsWith('127.'));
+  } catch (e) { return []; }
+}
+
+function smbValidateFolder(folder) {
+  if (!folder) throw new Error('公開するフォルダを選択してください');
+  if (folder.includes('/') || folder.includes('\\') || folder === '.' || folder === '..') {
+    throw new Error('フォルダ名が不正です');
+  }
+  if (/[\[\]\n\r]/.test(folder)) {
+    throw new Error('フォルダ名に使用できない文字が含まれています');
+  }
+  const abs = path.join(ROOT_DIR, folder);
+  if (!fs.existsSync(abs) || !fs.statSync(abs).isDirectory()) {
+    throw new Error('公開するフォルダが見つかりません: ' + folder);
+  }
+  return abs;
+}
+
+function smbValidateUsername(username) {
+  if (!/^[a-z_][a-z0-9_-]{0,31}$/i.test(username)) {
+    throw new Error('ユーザー名は英数字・_-・最大32文字で入力してください');
+  }
+}
+
+app.get('/api/samba/folders', (req, res) => {
+  try {
+    const dirs = [];
+    for (const ent of fs.readdirSync(ROOT_DIR, { withFileTypes: true })) {
+      if (ent.isDirectory()) dirs.push(ent.name);
+    }
+    dirs.sort((a, b) => a.localeCompare(b, 'ja'));
+    res.json({ success: true, folders: dirs });
+  } catch (e) {
+    sendErr(res, e.message, e.status || 500);
+  }
+});
+
+app.get('/api/samba/status', async (req, res) => {
+  try {
+    const installed = smbIsInstalled();
+    const active = installed ? await smbDaemonActive() : false;
+    const state = smbReadState();
+    const content = installed ? smbManagedContent() : '';
+    const shareActive = !!(state && state.enabled && state.share && content.includes('[' + state.share + ']'));
+    const ips = installed ? await smbServerIps() : [];
+    const tailnet = installed ? await tailnetHostname() : '';
+    const autostart = installed ? await smbAutostartEnabled() : false;
+    res.json({
+      success: true,
+      installed,
+      running: shareActive && active,
+      smbdActive: active,
+      share: state ? {
+        folder: state.folder || '',
+        share: state.share || '',
+        username: state.username || '',
+        guestOk: !!state.guestOk,
+        readonly: !!state.readonly,
+        enabled: !!state.enabled
+      } : null,
+      ips,
+      tailnet,
+      autostart,
+      installing: smbInstalling,
+      busy: smbBusy
+    });
+  } catch (e) {
+    sendErr(res, e.message, e.status || 500);
+  }
+});
+
+app.get('/api/samba/install', (req, res) => {
+  if (smbInstalling) return sendErr(res, 'セットアップがすでに進行中です', 409);
+  if (smbIsInstalled()) return sendErr(res, 'Samba はすでにインストールされています', 400);
+  smbInstalling = true;
+  res.writeHead(200, {
+    'Content-Type': 'text/event-stream',
+    'Cache-Control': 'no-cache',
+    Connection: 'keep-alive',
+    'X-Accel-Buffering': 'no'
+  });
+  const send = (event, data) => res.write('event: ' + event + '\ndata: ' + JSON.stringify(data) + '\n\n');
+  const log = m => send('log', { message: m });
+  (async () => {
+    try {
+      log('Samba のセットアップを開始します');
+      log('パッケージリストを更新中...');
+      await sh('apt-get', ['update'], { timeout: 600000 });
+      log('Samba をインストール中...（数分かかる場合があります）');
+      await sh('bash', ['-c', 'DEBIAN_FRONTEND=noninteractive apt-get install -y samba'], { timeout: 1800000 });
+      log('smbd を有効化・起動中...');
+      try {
+        await sh('systemctl', ['enable', '--now', 'smbd'], { timeout: 60000 });
+      } catch (e) {
+        await sh('service', ['smbd', 'start'], { timeout: 60000 }).catch(() => {});
+      }
+      smbEnsureInclude();
+      log('設定ファイルの include を確認しました');
+      log('Samba のインストールが完了しました！');
+      send('done', { ok: true });
+    } catch (e) {
+      const detail = (e.stderr || e.stdout || e.message || String(e)).toString().slice(0, 500);
+      send('done', { ok: false, error: detail });
+    } finally {
+      smbInstalling = false;
+    }
+  })();
+});
+
+app.post('/api/samba/start', async (req, res) => {
+  if (smbBusy) return sendErr(res, 'すでに処理中です', 409);
+  try {
+    if (!smbIsInstalled()) return sendErr(res, 'Samba がインストールされていません');
+    const body = req.body || {};
+    const folder = String(body.folder || '').trim();
+    const guestOk = !!body.guestOk;
+    const readonly = !!body.readonly;
+    const username = String(body.username || '').trim();
+    const password = String(body.password || '');
+    const abs = smbValidateFolder(folder);
+    const share = folder;
+    if (!guestOk) {
+      if (!username) return sendErr(res, 'ユーザー名を入力してください（匿名の場合は匿名アクセスを有効にしてください）');
+      smbValidateUsername(username);
+      const isNew = !(await smbSambaUserExists(username));
+      if (isNew && !password) return sendErr(res, '新規ユーザーのためパスワードを入力してください');
+    }
+    smbBusy = true;
+    try {
+      if (!guestOk) {
+        await smbEnsureSystemUser(username);
+        if (password) await smbSetPassword(username, password);
+        else if (!(await smbSambaUserExists(username))) {
+          return sendErr(res, 'パスワードを入力してください');
+        }
+      }
+      const forceUser = await smbOwnerName(abs);
+      smbEnsureInclude();
+      fs.writeFileSync(SMB_MANAGED_CONF, smbShareBlock(share, abs, username, guestOk, readonly, forceUser));
+      try {
+        await sh('testparm', ['-s'], { timeout: 30000 });
+      } catch (e) {
+        throw new Error('smb.conf の検証に失敗しました: ' + ((e.stderr || e.message || '').toString().slice(0, 300)));
+      }
+      try { fs.chmodSync(abs, 0o755); } catch (e) {}
+      try {
+        await sh('systemctl', ['enable', '--now', 'smbd'], { timeout: 60000 });
+      } catch (e) {}
+      await smbReload();
+      smbWriteState({ folder, share, username: guestOk ? '' : username, guestOk, readonly, enabled: true });
+      const ips = await smbServerIps();
+      res.json({ success: true, folder, share, guestOk, readonly, ips });
+    } finally {
+      smbBusy = false;
+    }
+  } catch (e) {
+    smbBusy = false;
+    sendErr(res, e.message, e.status || 500);
+  }
+});
+
+app.post('/api/samba/stop', async (req, res) => {
+  if (smbBusy) return sendErr(res, 'すでに処理中です', 409);
+  try {
+    if (!smbIsInstalled()) return sendErr(res, 'Samba がインストールされていません');
+    smbBusy = true;
+    try {
+      const prev = smbReadState() || {};
+      fs.writeFileSync(SMB_MANAGED_CONF, '# Managed by selfEx - no shares configured\n');
+      await smbReload().catch(() => {});
+      smbWriteState({
+        folder: prev.folder || '',
+        share: prev.share || '',
+        username: prev.username || '',
+        guestOk: !!prev.guestOk,
+        readonly: !!prev.readonly,
+        enabled: false
+      });
+      res.json({ success: true });
+    } finally {
+      smbBusy = false;
+    }
+  } catch (e) {
+    smbBusy = false;
+    sendErr(res, e.message, e.status || 500);
+  }
+});
+
+app.post('/api/samba/autostart', async (req, res) => {
+  try {
+    if (!smbIsInstalled()) return sendErr(res, 'Samba がインストールされていません');
+    const on = !(req.body && req.body.enabled === false);
+    await sh('systemctl', [on ? 'enable' : 'disable', 'smbd'], { timeout: 30000 });
+    res.json({ success: true, autostart: on });
+  } catch (e) {
+    sendErr(res, e.message, e.status || 500);
+  }
+});
+
+/* ── バックアップ（rsync + SSH。selfphoto のバックアップ機能と同方式） ──
+   ソース複数・ターゲット1箇所。フォルダ構成を維持するため
+   ターゲット配下にソース相対パスごとにコピーする。
+   固定オプション: -r -t -u -v --progress（除外: .upload-tmp/）。
+   ミラーリングON時は --delete を追加し、ソースに無いファイルを削除する。 */
+const BK_FILE = '/var/lib/selfex/backup.json';
+const BK_FIXED_OPTS = ['-r', '-t', '-u', '-v', '--progress'];
+const BK_EXCLUDE = '.upload-tmp/';
+const BK_INTERVALS = [60, 300, 900, 1800, 3600];
+const BK_DEFAULT_INTERVAL = 300;
+const BK_WATCH_MODES = ['interval', 'time'];
+const BK_DEFAULT_TIMES = ['02:00'];
+const BK_DEFAULT_DAYS = [0, 1, 2, 3, 4, 5, 6];
+const BK_TIME_POLL_SEC = 15;
+const BK_SSH_TIMEOUT = 20000;
+let bkRunning = false;
+let bkLastRun = null;
+let bkWatchTimer = null;
+let bkLastFiredMinute = null;
+let bkSshpassInstalling = false;
+
+function bkHas(cmd) {
+  const dirs = String(process.env.PATH || '/usr/bin:/bin').split(':');
+  return dirs.some(d => { try { return fs.statSync(path.join(d, cmd)).isFile(); } catch (e) { return false; } });
+}
+
+function bkDefaultConfig() {
+  return {
+    sources: [],
+    target: '',
+    mirror: false,
+    ssh: { enabled: false, host: '', user: '', port: '22', key: '', password: '' },
+    watch: { enabled: false, mode: 'interval', intervalSec: BK_DEFAULT_INTERVAL,
+      times: BK_DEFAULT_TIMES.slice(), days: BK_DEFAULT_DAYS.slice() },
+    lastRun: null
+  };
+}
+
+function bkLoad() {
+  const cfg = bkDefaultConfig();
+  try {
+    if (fs.existsSync(BK_FILE)) {
+      const saved = JSON.parse(fs.readFileSync(BK_FILE, 'utf8'));
+      if (saved && typeof saved === 'object') {
+        if (Array.isArray(saved.sources)) cfg.sources = saved.sources.filter(s => typeof s === 'string');
+        if (typeof saved.target === 'string') cfg.target = saved.target;
+        if ('mirror' in saved) cfg.mirror = !!saved.mirror;
+        if (saved.ssh && typeof saved.ssh === 'object') {
+          for (const k of ['enabled', 'host', 'user', 'port', 'key', 'password']) {
+            if (k in saved.ssh) cfg.ssh[k] = k === 'enabled' ? !!saved.ssh[k] : String(saved.ssh[k] || '');
+          }
+        }
+        if (saved.watch && typeof saved.watch === 'object') {
+          cfg.watch = bkNormWatch(Object.assign({}, cfg.watch, saved.watch));
+        }
+        /* bkLoad は純粋な読み取り専用にする。以前はここで bkLastRun を上書きしており、
+           bkFinish() 内の bkLoad() が確定直後の実行結果をディスクの古い値で
+           消し去っていた（初回実行の記録だけが残り続け、2回目以降がUIに反映されない）。 */
+        if (saved.lastRun && typeof saved.lastRun === 'object') { cfg.lastRun = saved.lastRun; }
+      }
+    }
+  } catch (e) {}
+  return cfg;
+}
+
+function bkSave(cfg) {
+  try { fs.mkdirSync(path.dirname(BK_FILE), { recursive: true }); } catch (e) {}
+  const tmp = BK_FILE + '.tmp';
+  fs.writeFileSync(tmp, JSON.stringify(cfg, null, 2));
+  fs.renameSync(tmp, BK_FILE);
+  try { fs.chmodSync(BK_FILE, 0o600); } catch (e) {}
+}
+
+function bkParseTime(s) {
+  const m = String(s == null ? '' : s).trim().match(/^(\d{1,2}):(\d{1,2})$/);
+  if (!m) return null;
+  const h = parseInt(m[1], 10), mi = parseInt(m[2], 10);
+  if (h < 0 || h > 23 || mi < 0 || mi > 59) return null;
+  return ('0' + h).slice(-2) + ':' + ('0' + mi).slice(-2);
+}
+
+function bkNormWatch(w) {
+  const src = (w && typeof w === 'object') ? w : {};
+  let mode = String(src.mode || 'interval');
+  if (BK_WATCH_MODES.indexOf(mode) < 0) mode = 'interval';
+  let iv = parseInt(src.intervalSec, 10);
+  if (!BK_INTERVALS.includes(iv)) iv = BK_DEFAULT_INTERVAL;
+  let times = [];
+  const rawTimes = Array.isArray(src.times) ? src.times : [src.times];
+  for (const t of rawTimes) {
+    const p = bkParseTime(t);
+    if (p && times.indexOf(p) < 0) times.push(p);
+    if (times.length >= 10) break;
+  }
+  if (!times.length) times = BK_DEFAULT_TIMES.slice();
+  let days = [];
+  const rawDays = Array.isArray(src.days) ? src.days : [];
+  for (const d of rawDays) {
+    const di = parseInt(d, 10);
+    if (di >= 0 && di <= 6 && days.indexOf(di) < 0) days.push(di);
+  }
+  if (!days.length) days = BK_DEFAULT_DAYS.slice();
+  days.sort();
+  return { enabled: !!src.enabled, mode, intervalSec: iv, times, days };
+}
+
+function bkNormSources(list) {
+  const out = [];
+  for (const s of (Array.isArray(list) ? list : [])) {
+    const t = String(s || '').trim().replace(/^\/+|\/+$/g, '');
+    if (!t || t === '.' || t === '..' || t.includes('\\')) continue;
+    if (t.split('/').includes('..')) continue;
+    if (!out.includes(t)) out.push(t);
+  }
+  return out;
+}
+
+function bkCheckSourceDir(rel) {
+  if (!rel) return 'source required';
+  let abs;
+  try { abs = safeResolve(rel); } catch (e) { return 'invalid source path'; }
+  try {
+    if (!fs.statSync(abs).isDirectory()) return 'source is not a folder: ' + rel;
+  } catch (e) { return 'source not found: ' + rel; }
+  return null;
+}
+
+/* 保存時バリデーション（target 空は許容）。実行時は forRun=true で厳密に。 */
+function bkValidate(cfg, forRun) {
+  const ssh = cfg.ssh || {};
+  for (const s of (cfg.sources || [])) {
+    const err = bkCheckSourceDir(s);
+    if (err) return err;
+  }
+  if (forRun && (!cfg.sources || !cfg.sources.length)) return 'source required';
+  const tgt = String(cfg.target || '').trim();
+  if (forRun && !tgt) return 'target required';
+  if (tgt) {
+    if (ssh.enabled && (ssh.host || '').trim()) {
+      const rp = bkParseRemote(tgt);
+      if (!rp || !/^(\/|~)/.test(rp)) return 'remote target must be absolute path';
+    } else if (!path.isAbsolute(tgt)) {
+      return 'target must be absolute';
+    }
+  }
+  if (ssh.enabled && !(ssh.host || '').trim()) return 'ssh host required';
+  const w = bkNormWatch(cfg.watch || {});
+  if (!BK_INTERVALS.includes(w.intervalSec)) return 'bad interval';
+  if (w.mode === 'time') {
+    if (!w.times.length) return 'bad time';
+    for (const t of w.times) { if (!bkParseTime(t)) return 'bad time'; }
+    if (!w.days.length || w.days.some(d => !(d >= 0 && d <= 6))) return 'bad days';
+  }
+  return null;
+}
+
+function bkSshDest(ssh) {
+  const host = String((ssh || {}).host || '').trim();
+  const user = String((ssh || {}).user || '').trim();
+  return user ? (user + '@' + host) : host;
+}
+
+function bkSshArgs(ssh) {
+  const args = ['ssh', '-o', 'StrictHostKeyChecking=no', '-o', 'ConnectTimeout=10'];
+  const port = String((ssh || {}).port || '22').trim() || '22';
+  if (port !== '22') args.push('-p', port);
+  const key = String((ssh || {}).key || '').trim();
+  if (key) args.push('-i', key);
+  return args;
+}
+
+function bkSshEnv(ssh) {
+  const pw = String((ssh || {}).password || '');
+  if (pw && bkHas('sshpass')) return { SSHPASS: pw };
+  return {};
+}
+
+function bkSshPrefix(ssh) {
+  return Object.keys(bkSshEnv(ssh)).length ? ['sshpass', '-e'] : [];
+}
+
+function bkParseRemote(tgt) {
+  const t = String(tgt || '').trim();
+  if (t.includes(':')) return t.slice(t.lastIndexOf(':') + 1).trim() || t;
+  return t;
+}
+
+function bkExec(cmd, args, envAdd, timeoutMs) {
+  return new Promise((resolve, reject) => {
+    execFile(cmd, args, {
+      timeout: timeoutMs || 30000,
+      maxBuffer: 4 * 1024 * 1024,
+      env: Object.assign({}, process.env, envAdd || {})
+    }, (err, stdout, stderr) => {
+      if (err) { err.stdout = stdout; err.stderr = stderr; return reject(err); }
+      resolve({ stdout: stdout || '', stderr: stderr || '' });
+    });
+  });
+}
+
+function bkSshDiag(ssh) {
+  let runUser = 'uid=' + (typeof process.getuid === 'function' ? process.getuid() : '?');
+  try { runUser = require('os').userInfo().username; } catch (e) {}
+  const home = require('os').homedir();
+  const key = String((ssh || {}).key || '').trim();
+  const keyInfo = { specified: !!key };
+  if (key) {
+    try {
+      const st = fs.statSync(key);
+      keyInfo.path = key;
+      keyInfo.exists = st.isFile();
+      try { fs.accessSync(key, fs.constants.R_OK); keyInfo.readable = true; } catch (e) { keyInfo.readable = false; }
+    } catch (e) { keyInfo.path = key; keyInfo.exists = false; keyInfo.readable = false; }
+  }
+  const defaults = [];
+  for (const n of ['id_ed25519', 'id_ecdsa', 'id_rsa']) {
+    try { if (fs.statSync(path.join(home, '.ssh', n)).isFile()) defaults.push(n); } catch (e) {}
+  }
+  return {
+    runUser, home,
+    sshpassAvailable: bkHas('sshpass'),
+    passwordSet: !!((ssh || {}).password),
+    key: keyInfo,
+    defaultKeys: defaults
+  };
+}
+
+function bkSshHint(ssh, diag) {
+  const hints = [];
+  if (diag.passwordSet && !diag.sshpassAvailable) {
+    hints.push('パスワードが入力されていますが sshpass が無いためパスワード認証に使われていません (apt install sshpass が必要)。');
+  }
+  const k = diag.key || {};
+  if (k.specified) {
+    if (!k.exists) hints.push('鍵ファイル ' + k.path + ' がサーバー上に存在しません (サーバーから見える絶対パスを指定してください)。');
+    else if (!k.readable) hints.push('鍵ファイル ' + k.path + ' が読み取れません (パーミッションを確認)。');
+  } else if (!(diag.defaultKeys || []).length) {
+    hints.push('サーバー実行ユーザー(' + diag.runUser + ')の ' + diag.home + '/.ssh に秘密鍵が無く、鍵ファイルも未指定です。サーバー用の鍵を作って転送先に登録するか、鍵ファイルに絶対パスを指定してください。');
+  }
+  if (!hints.length) hints.push('転送先の authorized_keys・ユーザー名・パスワードを確認してください。');
+  return hints.join(' ');
+}
+
+function bkSshFull(ssh, extra) {
+  const full = bkSshPrefix(ssh).concat(bkSshArgs(ssh)).concat(extra || []);
+  return { cmd: full[0], args: full.slice(1) };
+}
+
+async function bkTestSsh(ssh) {
+  const host = String((ssh || {}).host || '').trim();
+  if (!host) return { ok: false, error: 'ssh host required' };
+  if (!bkHas('ssh')) return { ok: false, error: 'ssh not found' };
+  const diag = bkSshDiag(ssh);
+  if (diag.passwordSet && !diag.sshpassAvailable) {
+    return { ok: false, error: 'パスワード認証できません: sshpass が未導入のため無視されます。apt install sshpass で導入するか、鍵認証を使ってください。', diagnostics: diag , needSshpassInstall: true };
+  }
+  const dest = bkSshDest(ssh);
+  try {
+    const full = bkSshFull(ssh, [dest, 'echo', 'ok']);
+    const r = await bkExec(full.cmd, full.args, bkSshEnv(ssh), BK_SSH_TIMEOUT);
+    if ((r.stdout || '').trim().endsWith('ok')) return { ok: true, message: 'SSH接続OK', diagnostics: diag };
+    return { ok: false, error: 'ssh connection failed: ' + ((r.stdout + r.stderr) || '').trim().slice(0, 2000), diagnostics: diag };
+  } catch (e) {
+    const log = String((e.stdout || '') + (e.stderr || '') + (e.message || '')).slice(0, 2000);
+    let err = 'ssh connection failed: ' + log;
+    if (/Permission denied/i.test(log)) err += ' [ヒント: ' + bkSshHint(ssh, diag) + ']';
+    return { ok: false, error: err, diagnostics: diag };
+  }
+}
+
+async function bkCheckTarget(target, ssh, create) {
+  const tgt = String(target || '').trim();
+  if (!tgt) return { ok: false, error: 'target required' };
+  const useSsh = !!((ssh || {}).enabled && String((ssh || {}).host || '').trim());
+  if (useSsh) {
+    const remote = bkParseRemote(tgt);
+    if (!remote || !/^(\/|~)/.test(remote)) return { ok: false, error: 'remote target must be absolute path' };
+    if (!bkHas('ssh')) return { ok: false, error: 'ssh not found' };
+    const dest = bkSshDest(ssh);
+    const env = bkSshEnv(ssh);
+    const run = (args) => { const full = bkSshFull(ssh, [dest].concat(args)); return bkExec(full.cmd, full.args, env, BK_SSH_TIMEOUT); };
+    try {
+      let existed = true;
+      try { await run(['test', '-d', remote]); } catch (e) { existed = false; }
+      if (!existed && create !== false) {
+        try { await run(['mkdir', '-p', remote]); }
+        catch (e) { return { ok: false, error: 'mkdir remote failed: ' + String((e.stdout || '') + (e.stderr || e.message || '')).slice(0, 2000) }; }
+      }
+      try { await run(['test', '-d', remote]); }
+      catch (e) { return { ok: false, error: 'remote target not found: ' + String((e.stdout || '') + (e.stderr || '')).slice(0, 2000) }; }
+      return { ok: true, created: !existed, message: existed ? 'フォルダOK（既存）' : 'フォルダを作成しました' };
+    } catch (e) {
+      return { ok: false, error: String(e.message || e).slice(0, 2000) };
+    }
+  }
+  if (!path.isAbsolute(tgt)) return { ok: false, error: 'target must be absolute' };
+  const existed = (() => { try { return fs.statSync(tgt).isDirectory(); } catch (e) { return false; } })();
+  if (!existed && create !== false) {
+    try { fs.mkdirSync(tgt, { recursive: true }); }
+    catch (e) { return { ok: false, error: 'mkdir target failed: ' + e.message }; }
+  }
+  try {
+    if (!fs.statSync(tgt).isDirectory()) return { ok: false, error: 'target not found' };
+  } catch (e) { return { ok: false, error: 'target not found' }; }
+  try { fs.accessSync(tgt, fs.constants.W_OK | fs.constants.X_OK); }
+  catch (e) { return { ok: false, error: 'target not writable' }; }
+  return { ok: true, created: !existed, message: existed ? 'フォルダOK（既存）' : 'フォルダを作成しました' };
+}
+
+function bkBuildJobs(cfg) {
+  const ssh = cfg.ssh || {};
+  const useSsh = !!(ssh.enabled && String(ssh.host || '').trim());
+  const tgt = String(cfg.target || '').trim();
+  return (cfg.sources || []).map(rel => {
+    const srcAbs = path.join(ROOT_DIR, rel) + '/';
+    let dest, sshCmd = null, envAdd = {};
+    if (useSsh) {
+      const parts = ['ssh', '-o', 'StrictHostKeyChecking=no'];
+      const port = String(ssh.port || '22').trim() || '22';
+      if (port !== '22') parts.push('-p', port);
+      const key = String(ssh.key || '').trim();
+      if (key) parts.push('-i', key);
+      sshCmd = parts.join(' ');
+      const user = String(ssh.user || '').trim();
+      const prefix = user ? (user + '@') : '';
+      const remoteBase = bkParseRemote(tgt).replace(/\/+$/, '');
+      const remoteDest = remoteBase + '/' + rel;
+      dest = prefix + String(ssh.host).trim() + ':' + remoteDest;
+      const pw = String(ssh.password || '');
+      if (pw && bkHas('sshpass')) envAdd.SSHPASS = pw;
+    } else {
+      dest = path.join(tgt, rel) + '/';
+    }
+    let argv = ['rsync'].concat(BK_FIXED_OPTS).concat(['--exclude=' + BK_EXCLUDE]);
+    if (cfg.mirror) argv.push('--delete');
+    if (sshCmd) argv = argv.concat(['-e', sshCmd]);
+    if (Object.keys(envAdd).length) argv = ['sshpass', '-e'].concat(argv);
+    argv = argv.concat([srcAbs, dest]);
+    return { rel, srcAbs, dest, argv, envAdd, useSsh };
+  });
+}
+
+function bkRunSpawn(argv, envAdd) {
+  return new Promise((resolve) => {
+    const cmd = argv[0];
+    const args = argv.slice(1);
+    let child;
+    try {
+      child = spawn(cmd, args, { env: Object.assign({}, process.env, envAdd || {}) });
+    } catch (e) {
+      resolve({ code: -1, log: 'spawn failed: ' + (e.message || e) });
+      return;
+    }
+    let out = '';
+    const push = (d) => { out += d.toString(); if (out.length > 60000) out = out.slice(-60000); };
+    child.stdout.on('data', push);
+    child.stderr.on('data', push);
+    const to = setTimeout(() => { try { child.kill('SIGKILL'); } catch (e) {} }, 6 * 3600 * 1000);
+    child.on('error', (e) => { clearTimeout(to); resolve({ code: -1, log: out + '\nspawn error: ' + (e.message || e) }); });
+    child.on('close', (code) => { clearTimeout(to); resolve({ code: code == null ? -1 : code, log: out }); });
+  });
+}
+
+function bkFinish(ok, exitCode, log, started, detail) {
+  bkLastRun = { ok, exitCode, startedAt: started, finishedAt: Date.now() / 1000, logTail: String(log || '').slice(-8000), detail: detail || '' };
+  try {
+    const cfg = bkLoad();
+    cfg.lastRun = bkLastRun;
+    bkSave(cfg);
+  } catch (e) {}
+  return Object.assign({}, bkLastRun);
+}
+
+async function bkRunOnce(detail) {
+  if (bkRunning) return { ok: false, alreadyRunning: true };
+  bkRunning = true;
+  const started = Date.now() / 1000;
+  try {
+    if (!bkHas('rsync')) return bkFinish(false, -1, 'rsync not found (apt install rsync で導入してください)', started, detail);
+    const cfg = bkLoad();
+    const err = bkValidate(cfg, true);
+    if (err) return bkFinish(false, -1, 'invalid config: ' + err, started, detail);
+    const jobs = bkBuildJobs(cfg);
+    let allLog = '';
+    let fail = 0;
+    for (const job of jobs) {
+      if (!job.useSsh) {
+        try { fs.mkdirSync(job.dest, { recursive: true }); }
+        catch (e) { allLog += '\n[' + job.rel + '] mkdir failed: ' + e.message + '\n'; fail++; continue; }
+      } else {
+        const chk = await bkCheckTarget(cfg.target + '/' + job.rel, cfg.ssh, true);
+        if (!chk.ok) { allLog += '\n[' + job.rel + '] target check failed: ' + chk.error + '\n'; fail++; continue; }
+      }
+      allLog += '\n$ ' + job.argv.join(' ') + '\n';
+      const r = await bkRunSpawn(job.argv, job.envAdd);
+      allLog += r.log + '\n';
+      allLog += '[' + job.rel + '] exit ' + r.code + '\n';
+      if (r.code !== 0) fail++;
+    }
+    return bkFinish(fail === 0, fail === 0 ? 0 : 1, allLog, started, detail);
+  } catch (e) {
+    /* 予期せぬ例外も握りつぶさず、失敗として記録＋ログに残す。
+       （従来は .catch(()=>{}) で消え、lastRun が更新されず原因不明になっていた） */
+    try { console.error('Backup run failed: ' + ((e && e.stack) || e)); } catch (_) {}
+    return bkFinish(false, -1, 'exception: ' + String((e && e.message) || e).slice(0, 2000), started, detail);
+  } finally {
+    bkRunning = false;
+  }
+}
+
+function bkRunAsync(detail) {
+  if (bkRunning) return { ok: false, alreadyRunning: true };
+  setImmediate(() => { bkRunOnce(detail || 'manual').catch(() => {}); });
+  return { ok: true, started: true };
+}
+
+function bkStatus() {
+  const cfg = bkLoad();
+  return {
+    rsyncAvailable: bkHas('rsync'),
+    running: bkRunning,
+    watching: !!bkWatchTimer,
+    watch: cfg.watch,
+    sources: cfg.sources,
+    target: cfg.target,
+    lastRun: bkLastRun || cfg.lastRun || null
+  };
+}
+
+function bkCurrentWatch() {
+  try { return bkNormWatch(bkLoad().watch); }
+  catch (e) { return bkNormWatch(null); }
+}
+
+function bkTimeMatches(hm, wday, times, days) {
+  return days.indexOf(wday) >= 0 && times.indexOf(hm) >= 0;
+}
+
+function bkNowHM() {
+  const n = new Date();
+  const hm = ('0' + n.getHours()).slice(-2) + ':' + ('0' + n.getMinutes()).slice(-2);
+  return { hm, wday: n.getDay(), key: n.getFullYear() + '-' + (n.getMonth() + 1) + '-' + n.getDate() + ' ' + hm };
+}
+
+function bkTimeTick() {
+  if (bkRunning) return;
+  let w2;
+  try { w2 = bkCurrentWatch(); } catch (e) { return; }
+  if (!w2.enabled || w2.mode !== 'time') return;
+  const now = bkNowHM();
+  if (!bkTimeMatches(now.hm, now.wday, w2.times, w2.days)) return;
+  if (bkLastFiredMinute === now.key) return;
+  bkLastFiredMinute = now.key;
+  console.log('Backup watch-time matched ' + now.key + ' -> starting backup');
+  bkRunOnce('watch-time').catch(() => {});
+}
+
+function bkSetWatch(enabled) {
+  if (bkWatchTimer) { clearInterval(bkWatchTimer); bkWatchTimer = null; }
+  if (enabled) {
+    const w = bkCurrentWatch();
+    if (w.mode === 'time') {
+      /* bkLastFiredMinute はここでリセットしない。保存し直し直後の同一分による
+         二重実行を防ぐため（キーに日付+時刻を含むので日またぎの誤抑止は起きない）。 */
+      console.log('Backup watch-time started: times=' + w.times.join(',') + ' days=' + w.days.join(','));
+      bkWatchTimer = setInterval(bkTimeTick, BK_TIME_POLL_SEC * 1000);
+      /* 保存・起動直後に即時判定する。対象分内に保存（例: 12:29:07に12:29を保存）や
+         対象分内の再起動でも、30秒後の初回ポーリングを待たずその場で実行される。
+         従来は初回ポーリングが対象分を外すと黙って翌日送りになっていた。 */
+      bkTimeTick();
+    } else {
+      const sec = BK_INTERVALS.includes(w.intervalSec) ? w.intervalSec : BK_DEFAULT_INTERVAL;
+      bkWatchTimer = setInterval(() => { if (!bkRunning) bkRunOnce('watch').catch(() => {}); }, sec * 1000);
+    }
+  }
+  return { ok: true, watching: !!bkWatchTimer };
+}
+
+function bkEnsureWatch() {
+  try { if (bkLoad().watch.enabled) bkSetWatch(true); } catch (e) {}
+}
+
+function bkSshFromBody(body) {
+  const saved = bkLoad().ssh || {};
+  const ssh = Object.assign({}, saved);
+  if (body && typeof body.ssh === 'object' && body.ssh) {
+    for (const k of ['enabled', 'host', 'user', 'port', 'key', 'password']) {
+      if (k in body.ssh) {
+        const v = body.ssh[k];
+        ssh[k] = (k === 'enabled') ? !!v : (v == null ? '' : String(v));
+      }
+    }
+    if (body.ssh.password === undefined || body.ssh.password === '' || body.ssh.password === '****') {
+      ssh.password = saved.password || '';
+    }
+  }
+  return ssh;
+}
+
+app.get('/api/backup/config', (req, res) => {
+  try {
+    const cfg = bkLoad();
+    const ssh = Object.assign({}, cfg.ssh, { password: cfg.ssh.password ? '****' : '' });
+    res.json({ success: true, sources: cfg.sources, target: cfg.target, mirror: !!cfg.mirror, ssh, watch: cfg.watch,
+      fixedOptions: BK_FIXED_OPTS, exclude: BK_EXCLUDE, intervals: BK_INTERVALS,
+      rsyncAvailable: bkHas('rsync'), watching: !!bkWatchTimer, lastRun: bkLastRun || cfg.lastRun || null });
+  } catch (e) { sendErr(res, e.message, e.status || 500); }
+});
+
+app.post('/api/backup/config', (req, res) => {
+  try {
+    const body = req.body || {};
+    const cfg = bkLoad();
+    if ('sources' in body) cfg.sources = bkNormSources(body.sources);
+    if ('target' in body && typeof body.target === 'string') cfg.target = body.target.trim();
+    if ('mirror' in body) cfg.mirror = !!body.mirror;
+    if (body.ssh && typeof body.ssh === 'object') cfg.ssh = bkSshFromBody(body);
+    if (body.watch && typeof body.watch === 'object') {
+      const merged = Object.assign({}, cfg.watch);
+      if ('enabled' in body.watch) merged.enabled = !!body.watch.enabled;
+      if ('mode' in body.watch) merged.mode = body.watch.mode;
+      if ('intervalSec' in body.watch) merged.intervalSec = body.watch.intervalSec;
+      if ('times' in body.watch) merged.times = body.watch.times;
+      if ('days' in body.watch) merged.days = body.watch.days;
+      /* スケジュール (mode/intervalSec/times/days) が更新されたら自動で監視ONにする。
+         「時刻を指定して保存したのに実行されない」事故を防ぐため。
+         明示的な停止は /api/backup/watch (enabled:false) で行う。 */
+      if ('mode' in body.watch || 'intervalSec' in body.watch || 'times' in body.watch || 'days' in body.watch) {
+        merged.enabled = true;
+      }
+      cfg.watch = bkNormWatch(merged);
+    }
+    const err = bkValidate(cfg, false);
+    if (err) return sendErr(res, err);
+    bkSave(cfg);
+    bkSetWatch(!!cfg.watch.enabled);
+    res.json({ success: true, watching: !!cfg.watch.enabled });
+  } catch (e) { sendErr(res, e.message, e.status || 500); }
+});
+
+app.post('/api/backup/sources/add', (req, res) => {
+  try {
+    const rel = String((req.body || {}).path || '').trim().replace(/^\/+|\/+$/g, '');
+    if (!rel) return sendErr(res, 'フォルダを指定してください');
+    const err = bkCheckSourceDir(rel);
+    if (err) return sendErr(res, err);
+    const cfg = bkLoad();
+    const next = bkNormSources((cfg.sources || []).concat([rel]));
+    cfg.sources = next;
+    bkSave(cfg);
+    res.json({ success: true, sources: cfg.sources });
+  } catch (e) { sendErr(res, e.message, e.status || 500); }
+});
+
+app.post('/api/backup/sources/remove', (req, res) => {
+  try {
+    const rel = String((req.body || {}).path || '').trim().replace(/^\/+|\/+$/g, '');
+    const cfg = bkLoad();
+    cfg.sources = (cfg.sources || []).filter(s => s !== rel);
+    bkSave(cfg);
+    res.json({ success: true, sources: cfg.sources });
+  } catch (e) { sendErr(res, e.message, e.status || 500); }
+});
+
+app.post('/api/backup/run', (req, res) => {
+  try {
+    const r = bkRunAsync('manual');
+    if (r.alreadyRunning) return sendErr(res, 'バックアップがすでに実行中です', 409);
+    res.json({ success: true, started: true });
+  } catch (e) { sendErr(res, e.message, e.status || 500); }
+});
+
+app.get('/api/backup/status', (req, res) => {
+  try {
+    const st = bkStatus();
+    res.json(Object.assign({ success: true }, st));
+  } catch (e) { sendErr(res, e.message, e.status || 500); }
+});
+
+app.post('/api/backup/watch', (req, res) => {
+  try {
+    const enabled = !!((req.body || {}).enabled);
+    const cfg = bkLoad();
+    cfg.watch.enabled = enabled;
+    bkSave(cfg);
+    const r = bkSetWatch(enabled);
+    res.json({ success: true, watching: r.watching });
+  } catch (e) { sendErr(res, e.message, e.status || 500); }
+});
+
+app.post('/api/backup/ssh-test', async (req, res) => {
+  try {
+    const ssh = bkSshFromBody(req.body || {});
+    const r = await bkTestSsh(ssh);
+    if (r.ok) res.json({ success: true, message: r.message, diagnostics: r.diagnostics });
+    else res.json({ success: false, error: r.error, diagnostics: r.diagnostics, needSshpassInstall: !!r.needSshpassInstall });
+  } catch (e) { sendErr(res, e.message, e.status || 500); }
+});
+
+app.post('/api/backup/sshpass/install', async (req, res) => {
+  try {
+    if (bkHas('sshpass')) return res.json({ success: true, message: 'sshpass はすでにインストールされています', alreadyInstalled: true });
+    if (bkSshpassInstalling) return sendErr(res, 'インストールがすでに進行中です', 409);
+    bkSshpassInstalling = true;
+    try {
+      await sh('apt-get', ['update'], { timeout: 600000 });
+      await sh('bash', ['-c', 'DEBIAN_FRONTEND=noninteractive apt-get install -y sshpass'], { timeout: 1800000 });
+      if (!bkHas('sshpass')) return sendErr(res, 'インストールを実行しましたが sshpass が見つかりません');
+      res.json({ success: true, message: 'sshpass をインストールしました' });
+    } finally {
+      bkSshpassInstalling = false;
+    }
+  } catch (e) {
+    sendErr(res, (e.stderr || e.stdout || e.message || String(e)).toString().slice(0, 500));
+  }
+});
+
+app.post('/api/backup/target-check', async (req, res) => {
+  try {
+    const body = req.body || {};
+    const target = (typeof body.target === 'string') ? body.target : bkLoad().target;
+    const ssh = bkSshFromBody(body);
+    const r = await bkCheckTarget(target, ssh, true);
+    if (r.ok) res.json({ success: true, message: r.message, created: r.created });
+    else res.json({ success: false, error: r.error });
+  } catch (e) { sendErr(res, e.message, e.status || 500); }
+});
+
+
+/* ── 起動時の自動復元（Web サーバ） ── */
+async function bootRestoreWeb() {
+  const saved = webReadSaved();
+  if (!saved.autostart || !saved.folder) return;
+  for (let i = 0; i < 6; i++) {
+    try {
+      await startWebServer(saved.folder);
+      console.log('Web server auto-started for folder: ' + saved.folder);
+      return;
+    } catch (e) {
+      console.error('Web server auto-start failed (try ' + (i + 1) + '/6): ' + (e.message || e));
+      await new Promise(r => setTimeout(r, 15000));
+    }
+  }
+  console.error('Web server auto-start gave up for folder: ' + saved.folder);
+}
+
+/* 起動時に前回の実行結果をメモリへ1回だけ復元する（bkLoad は副作用なしのためここで行う） */
+try { bkLastRun = bkLoad().lastRun || null; } catch (e) { bkLastRun = null; }
+
+app.listen(PORT, HOST, () => {
+  console.log(`selfEx listening on http://${HOST}:${PORT}`);
+  console.log(`Root: ${ROOT_DIR}`);
+  bootRestoreWeb();
+  bkEnsureWatch();
+});

@@ -329,6 +329,22 @@
       <div class="dialog-footer"><button class="btn" id="createfile-cancel-btn">キャンセル</button><button class="btn primary" id="createfile-confirm">作成</button></div>
     </div>
   </div>
+  <div class="dialog-overlay" id="mount-dialog">
+    <div class="dialog small">
+      <div class="dialog-header"><h3 id="mount-title">マウント</h3><button class="dialog-close" id="mount-cancel">✕</button></div>
+      <div class="dialog-body">
+        <div style="margin-bottom:12px">
+          <label style="display:block;font-size:12px;color:var(--text-secondary);margin-bottom:4px">デバイス</label>
+          <input type="text" id="mount-device" class="dialog-input" readonly>
+        </div>
+        <div>
+          <label style="display:block;font-size:12px;color:var(--text-secondary);margin-bottom:4px">マウント先（フルパス）</label>
+          <input type="text" id="mount-input" class="dialog-input" placeholder="/mnt/xxx">
+        </div>
+      </div>
+      <div class="dialog-footer"><button class="btn" id="mount-cancel-btn">キャンセル</button><button class="btn primary" id="mount-confirm">マウント</button></div>
+    </div>
+  </div>
   <div class="dialog-overlay" id="info-dialog">
     <div class="dialog">
       <div class="dialog-header"><h3>詳細情報</h3><button class="dialog-close" id="info-close">✕</button></div>

@@ -252,3 +252,20 @@ body{font-family:"Segoe UI Variable","Segoe UI",system-ui,-apple-system,sans-ser
 #bk-days .day-btn{min-width:32px;text-align:center;padding:6px 8px;font-size:13px;border:1px solid var(--border-color);border-radius:var(--radius-sm);cursor:pointer;background:var(--bg-primary);color:var(--text-secondary);user-select:none}
 #bk-days .day-btn.on{background:var(--accent-color);border-color:var(--accent-color);color:#fff}
 .bk-mini-btn{flex-shrink:0;width:auto;padding:7px 12px}
+/* ── デバイス（マウント管理） ── */
+.disk-tree-section{padding:2px 0;margin-bottom:2px}
+.disk-tree-header{padding:6px 6px 2px}
+.disk-drive-content{color:var(--text-primary)}
+.disk-drive-name{font-weight:600;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.disk-drive-meta{font-size:10px;color:var(--text-tertiary);flex-shrink:0;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.disk-partition-content{font-size:12px}
+.disk-part-name{color:var(--text-secondary);font-family:monospace;font-size:11px;flex-shrink:0;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.disk-part-size{font-size:10px;color:var(--text-tertiary);flex-shrink:0}
+.disk-mount-link{display:inline-flex;align-items:center;gap:3px;font-size:11px;color:var(--accent-color);background:var(--accent-light);padding:1px 5px;border-radius:3px;flex-shrink:0;max-width:90px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;text-decoration:none;cursor:pointer}
+.disk-mount-link:hover{background:var(--accent-color);color:#fff}
+.disk-btn{font-size:10px;padding:1px 5px;border-radius:3px;border:1px solid var(--border-color);background:var(--bg-primary);cursor:pointer;flex-shrink:0;white-space:nowrap}
+.disk-btn.mount{color:var(--accent-color);border-color:var(--accent-color)}
+.disk-btn.mount:hover{background:var(--accent-color);color:#fff}
+.disk-btn.unmount{color:var(--danger-color);border-color:var(--danger-color)}
+.disk-btn.unmount:hover{background:var(--danger-color);color:#fff}
+.tree-empty-parts{font-size:12px;color:var(--text-tertiary);padding:2px 6px 2px 23px}

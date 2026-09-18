@@ -680,10 +680,17 @@ app.post('/api/mkdirp', (req, res) => {
   }
 });
 
-app.get('/api/info', (req, res) => {
+app.get('/api/info', async (req, res) => {
   try {
     const abs = safeResolve(req.query.path);
     const st = fs.statSync(abs);
+    let owner = 'unknown', group = 'unknown';
+    try {
+      const result = await sh('stat', ['-c', '%U:%G', abs], { timeout: 5000 });
+      const parts = result.stdout.trim().split(':');
+      owner = parts[0] || 'unknown';
+      group = parts[1] || 'unknown';
+    } catch (e) {}
     res.json({ success: true, info: {
       name: path.basename(abs),
       path: toRel(abs),
@@ -691,10 +698,69 @@ app.get('/api/info', (req, res) => {
       size: st.size,
       modified: st.mtime.toISOString(),
       created: st.birthtime.toISOString(),
-      permissions: (st.mode & 0o777).toString(8)
+      permissions: (st.mode & 0o777).toString(8),
+      owner,
+      group
     }});
   } catch (e) {
     sendErr(res, e.message, e.status || 400);
+  }
+});
+
+/* ── 権限変更（所有者・グループ・パーミッション） ── */
+app.post('/api/chmod', async (req, res) => {
+  try {
+    const abs = safeResolve(req.body.path);
+    const perms = String(req.body.permissions || '').trim();
+    if (!/^[0-7]{3,4}$/.test(perms)) return sendErr(res, '権限の形式が不正です');
+    await sh('chmod', [perms, abs], { timeout: 10000 });
+    res.json({ success: true });
+  } catch (e) {
+    sendErr(res, e.message, e.status || 400);
+  }
+});
+
+app.post('/api/chown', async (req, res) => {
+  try {
+    const abs = safeResolve(req.body.path);
+    const owner = String(req.body.owner || '').trim();
+    const group = String(req.body.group || '').trim();
+    if (!owner && !group) return sendErr(res, '所有者またはグループを指定してください');
+    const args = [];
+    if (owner && group) args.push(`${owner}:${group}`);
+    else if (owner) args.push(owner);
+    else args.push(`:${group}`);
+    args.push(abs);
+    await sh('chown', args, { timeout: 10000 });
+    res.json({ success: true });
+  } catch (e) {
+    sendErr(res, e.message, e.status || 400);
+  }
+});
+
+app.get('/api/users', async (req, res) => {
+  try {
+    const result = await sh('getent', ['passwd'], { timeout: 5000 });
+    const users = result.stdout.split('\n').filter(Boolean).map(line => {
+      const parts = line.split(':');
+      return { name: parts[0], uid: parseInt(parts[2]), gid: parseInt(parts[3]) };
+    }).filter(u => u.uid >= 0 && u.uid < 65534);
+    res.json({ success: true, users });
+  } catch (e) {
+    res.json({ success: true, users: [] });
+  }
+});
+
+app.get('/api/groups', async (req, res) => {
+  try {
+    const result = await sh('getent', ['group'], { timeout: 5000 });
+    const groups = result.stdout.split('\n').filter(Boolean).map(line => {
+      const parts = line.split(':');
+      return { name: parts[0], gid: parseInt(parts[2]) };
+    }).filter(g => g.gid >= 0 && g.gid < 65534);
+    res.json({ success: true, groups });
+  } catch (e) {
+    res.json({ success: true, groups: [] });
   }
 });
 

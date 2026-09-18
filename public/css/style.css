@@ -108,6 +108,17 @@ body{font-family:"Segoe UI Variable","Segoe UI",system-ui,-apple-system,sans-ser
 .info-grid{display:grid;grid-template-columns:110px 1fr;gap:6px}
 .info-label{font-weight:600;color:var(--text-secondary);font-size:13px}
 .info-value{word-break:break-all;font-size:14px}
+.info-grid .perm-span{grid-column:1/-1;margin-top:8px;border-top:1px solid var(--border-color);padding-top:10px}
+.perm-title{font-size:12px;font-weight:600;color:var(--text-secondary);margin-bottom:8px}
+.perm-row{display:flex;align-items:center;gap:8px;margin-bottom:6px}
+.perm-row>label{font-size:12px;color:var(--text-secondary);min-width:45px}
+.perm-select{flex:1;padding:4px 6px;border:1px solid var(--border-color);border-radius:var(--radius-sm);background:var(--bg-primary);color:var(--text-primary);font-size:12px;font-family:inherit}
+.perm-checkboxes{display:flex;flex-direction:column;gap:4px}
+.perm-group{display:flex;align-items:center;gap:6px}
+.perm-label{font-size:11px;color:var(--text-tertiary);min-width:35px}
+.perm-group label{font-size:12px;color:var(--text-primary);display:flex;align-items:center;gap:2px;cursor:pointer}
+.perm-group input[type="checkbox"]{accent-color:var(--accent-color)}
+.perm-actions{margin-top:8px;text-align:right}
 ::-webkit-scrollbar{width:6px;height:6px}
 ::-webkit-scrollbar-track{background:transparent}
 ::-webkit-scrollbar-thumb{background:var(--border-color);border-radius:3px}

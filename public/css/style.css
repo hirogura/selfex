@@ -49,21 +49,21 @@ body{font-family:"Segoe UI Variable","Segoe UI",system-ui,-apple-system,sans-ser
 .sort-controls select{padding:3px 6px;border:1px solid var(--border-color);border-radius:var(--radius-sm);font-size:12px;background:var(--bg-primary);color:var(--text-primary);font-family:inherit}
 .file-list-wrapper{flex:1;overflow:hidden;position:relative}
 .file-list{height:100%;overflow-y:auto;padding:8px 12px}
-.file-item{display:flex;align-items:center;padding:5px 10px;border-radius:var(--radius-sm);cursor:pointer;gap:10px;transition:background .08s}
-.file-item:hover{background:var(--bg-hover)}
+.file-item,.split-file-item{display:flex;align-items:center;padding:5px 10px;border-radius:var(--radius-sm);cursor:pointer;gap:10px;transition:background .08s}
+.file-item:hover,.split-file-item:hover{background:var(--bg-hover)}
 .file-item.selected{background:var(--accent-light);color:var(--accent-color)}
 .file-item.selected .file-meta{color:var(--accent-color)}
 .file-item.multi-selected{background:var(--accent-light);outline:2px solid var(--accent-color);outline-offset:-2px}
-.file-item .file-icon-wrap{width:28px;height:28px;display:flex;align-items:center;justify-content:center;flex-shrink:0}
-.file-item .file-icon-wrap svg{width:28px;height:28px}
+.file-item .file-icon-wrap,.split-file-item .file-icon-wrap{width:28px;height:28px;display:flex;align-items:center;justify-content:center;flex-shrink:0}
+.file-item .file-icon-wrap svg,.split-file-item .file-icon-wrap svg{width:28px;height:28px}
 .file-info{flex:1;min-width:0}
 .file-name{font-size:15px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;color:var(--text-primary)}
 .file-meta{font-size:12px;color:var(--text-secondary);margin-top:1px}
 .file-size{font-size:13px;color:var(--text-secondary);width:80px;text-align:right;flex-shrink:0}
 .file-date{font-size:13px;color:var(--text-secondary);width:140px;text-align:right;flex-shrink:0}
 .file-list.thumbnail-view{display:grid;grid-template-columns:repeat(auto-fill,minmax(110px,1fr));grid-auto-rows:auto;gap:4px;padding:12px;align-items:start;align-content:start;height:fit-content;min-height:0}
-.file-list.thumbnail-view .file-item{flex-direction:column;padding:10px 6px;text-align:center;min-height:0;height:fit-content;gap:4px;align-self:start;justify-self:center;border-radius:var(--radius);transition:background .08s}
-.file-list.thumbnail-view .file-item:hover{background:var(--bg-hover)}
+.file-list.thumbnail-view .file-item,.file-list.thumbnail-view .split-file-item{flex-direction:column;padding:10px 6px;text-align:center;min-height:0;height:fit-content;gap:4px;align-self:start;justify-self:center;border-radius:var(--radius);transition:background .08s}
+.file-list.thumbnail-view .file-item:hover,.file-list.thumbnail-view .split-file-item:hover{background:var(--bg-hover)}
 .file-list.thumbnail-view .file-item.selected{background:var(--accent-light)}
 .file-list.thumbnail-view .file-item.multi-selected{background:var(--accent-light);outline:2px solid var(--accent-color);outline-offset:-2px}
 .file-list.thumbnail-view .file-icon-wrap{width:64px;height:64px}
@@ -126,8 +126,17 @@ body{font-family:"Segoe UI Variable","Segoe UI",system-ui,-apple-system,sans-ser
 .loading{display:flex;align-items:center;justify-content:center;padding:40px;color:var(--text-secondary)}
 .empty-state{display:flex;flex-direction:column;align-items:center;justify-content:center;padding:60px 20px;color:var(--text-secondary)}
 .empty-state-icon{font-size:48px;margin-bottom:16px;opacity:.5}
-.file-item.dragging{opacity:.5}
-.file-item.drag-over,.tree-item-content.drag-over{background:var(--accent-light)!important;color:var(--accent-color)!important;outline:2px dashed var(--accent-color);outline-offset:-2px}
+.file-item.dragging,.split-file-item.dragging{opacity:.5}
+.file-item.drag-over,.split-file-item.drag-over,.tree-item-content.drag-over{background:var(--accent-light)!important;color:var(--accent-color)!important;outline:2px dashed var(--accent-color);outline-offset:-2px}
+/* ── 2分割表示（下ペイン） ── */
+.split-resize-handle{height:5px;flex-shrink:0;background:transparent;cursor:row-resize;transition:background .15s;position:relative;z-index:5;border-top:1px solid var(--border-color)}
+.split-resize-handle:hover,.split-resize-handle:active{background:var(--accent-color)}
+.split-pane{flex:1;min-height:80px;display:flex;flex-direction:column;overflow:hidden;border-top:1px solid var(--border-color);background:var(--bg-primary)}
+.split-toolbar{display:flex;align-items:center;gap:8px;padding:6px 14px;border-bottom:1px solid var(--border-color)}
+.split-title{font-size:11px;text-transform:uppercase;color:var(--text-tertiary);letter-spacing:.5px;font-weight:600;white-space:nowrap}
+.split-path-bar{flex:1}
+.split-file-item.split-selected{background:var(--accent-light);outline:2px solid var(--accent-color);outline-offset:-2px}
+.file-list.thumbnail-view .split-file-item.split-selected{background:var(--accent-light);outline:2px solid var(--accent-color);outline-offset:-2px}
 [data-draggable="true"]{cursor:grab}
 [data-draggable="true"]:active{cursor:grabbing}
 .selection-rect{position:absolute;border:1px solid var(--accent-color);background:rgba(0,103,192,.12);pointer-events:none;display:none;z-index:10}

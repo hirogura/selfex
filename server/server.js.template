@@ -498,6 +498,33 @@ app.post('/api/move-batch', (req, res) => {
   res.json({ success: true, moved, errors });
 });
 
+/* ── 一括コピー（2分割表示のペイン間 D&D 用） ── */
+app.post('/api/copy-batch', (req, res) => {
+  const paths = Array.isArray(req.body.paths) ? req.body.paths : [];
+  let destDir;
+  try { destDir = safeResolve(req.body.destPath); } catch (e) { return sendErr(res, e.message); }
+  try {
+    if (!isDir(destDir)) return sendErr(res, 'コピー先がフォルダではありません');
+  } catch (e) {
+    return sendErr(res, 'コピー先がフォルダではありません');
+  }
+  const errors = [];
+  let copied = 0;
+  for (const p of paths) {
+    try {
+      const src = safeResolve(p);
+      const dest = path.join(destDir, path.basename(src));
+      if (src === dest) continue;
+      if (fs.existsSync(dest)) throw new Error('同じ名前のファイルが既に存在します: ' + path.basename(src));
+      fs.cpSync(src, dest, { recursive: true, errorOnExist: true });
+      copied++;
+    } catch (e) {
+      errors.push({ path: p, error: e.message });
+    }
+  }
+  res.json({ success: true, copied, errors });
+});
+
 app.post('/api/delete', (req, res) => {
   try {
     const abs = safeResolve(req.body.path);

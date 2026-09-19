@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # =============================================================================
-#  selfEx v2.2.7 セットアップスクリプト（GitHub版）
+#  selfEx v2.2.8 セットアップスクリプト（GitHub版）
 #  - https://github.com/hirogura/selfex からクローン
 #  - /opt/selfex に配置、/ をブラウズ対象
 #  - ポート 3362 / systemd サービス / Tailscale Serve 対応（Tailnet内のみHTTPS公開）
@@ -261,7 +261,7 @@ fi
 # ── 完了サマリー ──────────────────────────────────────────────────────────────
 echo ""
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-ok "selfEx v2.2.7 セットアップ完了！"
+ok "selfEx v2.2.8 セットアップ完了！"
 echo ""
 if [ -n "${TS_HOSTNAME}" ]; then
   echo "  selfEx : https://${TS_HOSTNAME}:${PORT}"

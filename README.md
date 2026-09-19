@@ -4,7 +4,7 @@
 
 SelfExplorer をホスト用に移植したものです。見た目・操作感はそのままに、インストール先・ポート・ブラウズ対象・名称を変更しています。
 
-![ロゴ画像](images/selfexplorer-ph.png)
+![ロゴ画像](images/selfex-ph.png)
 
 ## インストール方法
 

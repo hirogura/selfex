@@ -1323,15 +1323,43 @@ async function tailnetHostname() {
   return '';
 }
 
-async function startWebServer(folder) {
+/* 公開フォルダのパス正規化（ホスト直インストール対応: 絶対パス入力可）。
+   入力は絶対パス (/mnt/share) でも ROOT_DIR からの相対パスでも受け付け、
+   ROOT_DIR 内の相対形 { rel, abs } にそろえて返す。 */
+function normSharePath(input) {
+  let raw = String(input || '').trim().replace(/\\/g, '/');
+  if (!raw) throw new Error('公開するフォルダのパスを入力してください');
+  raw = raw.replace(/\/+/g, '/');
+  if (raw.length > 1) raw = raw.replace(/\/+$/, '');
+  if (!raw || raw === '.') throw new Error('公開するフォルダのパスを入力してください');
+  if (/[\[\]\n\r]/.test(raw)) throw new Error('パスに使用できない文字が含まれています');
+  const abs = path.isAbsolute(raw) ? path.normalize(raw) : path.resolve(ROOT_DIR, raw);
+  const check = path.relative(ROOT_DIR, abs);
+  if (check === '..' || check.startsWith('..' + path.sep) || path.isAbsolute(check)) {
+    throw new Error('パスが不正です（公開範囲外です）');
+  }
+  const rel = check === '' ? '' : check.split(path.sep).join('/');
+  if (!rel || rel === '.') throw new Error('公開するフォルダのパスを入力してください');
+  if (rel.split('/').includes('..')) throw new Error('パスに .. は使用できません');
+  if (/[\[\]\n\r]/.test(rel)) throw new Error('パスに使用できない文字が含まれています');
+  if (!fs.existsSync(abs) || !fs.statSync(abs).isDirectory()) {
+    throw new Error('公開するフォルダが見つかりません: ' + String(input).trim());
+  }
+  return { rel, abs };
+}
+
+function shareNameOf(rel) {
+  const base = String(rel || '').split('/').filter(Boolean).pop() || '';
+  if (!base || /[\[\]\n\r]/.test(base)) throw new Error('フォルダ名に使用できない文字が含まれています');
+  return base;
+}
+
+async function startWebServer(folderInput) {
   if (webServerStarting) throw new Error('すでに処理中です');
+  const { rel: folder, abs } = normSharePath(folderInput);
   if (webServer && webFolder === folder) return null;
   if (webServer && webFolder !== folder) {
     await stopWebServer();
-  }
-  const abs = path.join(ROOT_DIR, folder);
-  if (!fs.existsSync(abs) || !fs.statSync(abs).isDirectory()) {
-    throw new Error('公開するフォルダが見つかりません: ' + folder);
   }
   webServerStarting = true;
   try {
@@ -1425,11 +1453,10 @@ app.get('/api/webserver/status', async (req, res) => {
 
 app.post('/api/webserver/start', async (req, res) => {
   try {
-    const folder = String((req.body && req.body.folder) || '').trim();
-    if (!folder) return sendErr(res, '公開するフォルダを選択してください');
-    if (folder.includes('/') || folder.includes('\\') || folder === '.' || folder === '..') {
-      return sendErr(res, 'フォルダ名が不正です');
-    }
+    const input = String((req.body && req.body.folder) || '').trim();
+    if (!input) return sendErr(res, '公開するフォルダのパスを入力してください');
+    let folder = input;
+    try { folder = normSharePath(input).rel; } catch (e) { return sendErr(res, e.message); }
     const r = await startWebServer(folder);
     res.json({ success: true, folder, port: WEB_SERVE_PORT, started: !!r });
   } catch (e) {
@@ -1603,19 +1630,9 @@ async function smbServerIps() {
   } catch (e) { return []; }
 }
 
-function smbValidateFolder(folder) {
-  if (!folder) throw new Error('公開するフォルダを選択してください');
-  if (folder.includes('/') || folder.includes('\\') || folder === '.' || folder === '..') {
-    throw new Error('フォルダ名が不正です');
-  }
-  if (/[\[\]\n\r]/.test(folder)) {
-    throw new Error('フォルダ名に使用できない文字が含まれています');
-  }
-  const abs = path.join(ROOT_DIR, folder);
-  if (!fs.existsSync(abs) || !fs.statSync(abs).isDirectory()) {
-    throw new Error('公開するフォルダが見つかりません: ' + folder);
-  }
-  return abs;
+function smbValidateFolder(folderInput) {
+  /* パス入力対応: 絶対パス・相対パスを受け付け、{ rel, abs } を返す */
+  return normSharePath(folderInput);
 }
 
 function smbValidateUsername(username) {
@@ -1714,13 +1731,16 @@ app.post('/api/samba/start', async (req, res) => {
   try {
     if (!smbIsInstalled()) return sendErr(res, 'Samba がインストールされていません');
     const body = req.body || {};
-    const folder = String(body.folder || '').trim();
+    const folderInput = String(body.folder || '').trim();
     const guestOk = !!body.guestOk;
     const readonly = !!body.readonly;
     const username = String(body.username || '').trim();
     const password = String(body.password || '');
-    const abs = smbValidateFolder(folder);
-    const share = folder;
+    let folder, abs, share;
+    try {
+      const v = smbValidateFolder(folderInput);
+      folder = v.rel; abs = v.abs; share = shareNameOf(v.rel);
+    } catch (e) { return sendErr(res, e.message); }
     if (!guestOk) {
       if (!username) return sendErr(res, 'ユーザー名を入力してください（匿名の場合は匿名アクセスを有効にしてください）');
       smbValidateUsername(username);

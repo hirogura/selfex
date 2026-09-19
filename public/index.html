@@ -118,10 +118,8 @@
                 <button class="oo-refresh" id="web-refresh" title="状態を再確認"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="23 4 23 10 17 10"/><polyline points="1 20 1 14 7 14"/><path d="M3.51 9a9 9 0 0114.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0020.49 15"/></svg></button>
               </div>
               <div class="web-body">
-                <label class="web-label" for="web-folder-select">公開フォルダ</label>
-                <select id="web-folder-select" class="web-select">
-                  <option value="">-- フォルダを選択 --</option>
-                </select>
+                <label class="web-label" for="web-folder-input">公開フォルダ（パス）</label>
+                <input type="text" id="web-folder-input" class="dialog-input smb-input" placeholder="例: /mnt/share" autocomplete="off">
                 <div class="web-actions">
                   <button class="oo-btn primary" id="web-start-btn">起動</button>
                   <button class="oo-btn" id="web-stop-btn" disabled>停止</button>
@@ -144,10 +142,8 @@
               </div>
               <div class="oo-notice" id="smb-notice" hidden></div>
               <div class="smb-body" id="smb-body" hidden>
-                <label class="web-label" for="smb-folder-select">公開フォルダ</label>
-                <select id="smb-folder-select" class="web-select">
-                  <option value="">-- フォルダを選択 --</option>
-                </select>
+                <label class="web-label" for="smb-folder-input">公開フォルダ（パス）</label>
+                <input type="text" id="smb-folder-input" class="dialog-input smb-input" placeholder="例: /mnt/share" autocomplete="off">
                 <label class="web-label" for="smb-username">ユーザー名</label>
                 <input type="text" id="smb-username" class="dialog-input smb-input" placeholder="例: shareuser" autocomplete="off">
                 <label class="web-label" for="smb-password">パスワード</label>

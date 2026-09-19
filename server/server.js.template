@@ -112,6 +112,31 @@ async function ooDockerDaemonReady(deadlineMs) {
   return false;
 }
 
+/* Docker デーモン起動失敗時の診断情報。UI に原因を表示するため末尾に絞って返す */
+async function ooDockerDiag() {
+  const parts = [];
+  try {
+    const r = await sh('systemctl', ['is-active', 'docker', 'containerd'], { timeout: 10000 });
+    parts.push('[systemctl] docker/containerd: ' + r.stdout.trim().split('\n').join(' '));
+  } catch (e) {
+    const out = ((e.stdout || '') + '\n' + (e.message || '')).trim();
+    if (out) parts.push('[systemctl] ' + out.split('\n').join(' ').slice(0, 200));
+  }
+  try {
+    const r = await sh('journalctl', ['-u', 'docker', '--no-pager', '-n', '20'], { timeout: 15000 });
+    const lines = r.stdout.trim().split('\n').slice(-12).join('\n');
+    if (lines) parts.push('[journalctl -u docker]\n' + lines);
+  } catch (e) {}
+  try {
+    await sh('docker', ['info'], { timeout: 15000 });
+  } catch (e) {
+    const msg = ((e.stderr || e.stdout || e.message || '') + '').trim().split('\n').slice(-5).join('\n');
+    if (msg) parts.push('[docker info]\n' + msg);
+  }
+  const hint = '対処のヒント: sudo systemctl status docker / sudo journalctl -u docker で詳細を確認してください';
+  return (parts.length ? parts.join('\n') : '診断情報を取得できませんでした') + '\n' + hint;
+}
+
 function ooReadComposeSecret() {
   try {
     const m = fs.readFileSync(OO_COMPOSE_FILE, 'utf8').match(/JWT_SECRET:\s*"([^"]+)"/);
@@ -1035,8 +1060,27 @@ app.get('/api/onlyoffice/install', (req, res) => {
         } else {
           await sh('bash', ['-c', 'curl -fsSL https://get.docker.com | sh'], { timeout: 900000 });
         }
-        await sh('systemctl', ['enable', '--now', 'docker'], { timeout: 60000 }).catch(() => {});
-        if (!(await ooDockerDaemonReady(60000))) throw new Error('Docker デーモンの起動に失敗しました');
+        /* Arch 系の docker.service は containerd への依存が Wants のため、
+           containerd が未有効化だと起動・再起動後に docker が失敗する。
+           明示的に有効化・起動してから docker を起動する（Debian 系でも無害）。 */
+        log('containerd を有効化・起動中...');
+        try {
+          await sh('systemctl', ['enable', '--now', 'containerd'], { timeout: 60000 });
+        } catch (e) { log('警告: containerd の起動に失敗しました: ' + (e.message || String(e))); }
+        log('Docker デーモンを有効化・起動中...');
+        try {
+          await sh('systemctl', ['enable', '--now', 'docker'], { timeout: 60000 });
+        } catch (e) { log('警告: docker の起動要求に失敗しました: ' + (e.message || String(e))); }
+        if (!(await ooDockerDaemonReady(60000))) {
+          /* 一時的な失敗の救済として 1 回だけ再起動して再試行する */
+          log('Docker デーモンの起動を確認できません。再起動して再試行します...');
+          try { await sh('systemctl', ['restart', 'docker'], { timeout: 60000 }); } catch (e) {}
+          if (!(await ooDockerDaemonReady(60000))) {
+            const diag = await ooDockerDiag();
+            log('Docker デーモンの起動に失敗しました:\n' + diag);
+            throw new Error('Docker デーモンの起動に失敗しました\n' + diag);
+          }
+        }
         log('Docker のインストールが完了しました');
       }
 

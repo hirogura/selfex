@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # =============================================================================
-#  selfEx v2.2.0 セットアップスクリプト（GitHub版）
+#  selfEx v2.2.4 セットアップスクリプト（GitHub版）
 #  - https://github.com/hirogura/selfex からクローン
 #  - /opt/selfex に配置、/ をブラウズ対象
 #  - ポート 3362 / systemd サービス / Tailscale Serve 対応（Tailnet内のみHTTPS公開）
@@ -41,20 +41,26 @@ else
   info "Debian 系 OS として処理します (ID=${OS_ID:-unknown})"
 fi
 
-# ── 必須コマンドの自動インストール（git / rsync / curl / python3） ─────────────
+# ── 必須コマンドの自動インストール（git / rsync / curl / python3 / ビルドツール） ─────
+# node-pty は Linux 用 prebuild を同梱しないため、インストール時に node-gyp ビルドが
+# 必須。gcc/make/g++ が無いと pty.node が生成されず、ターミナルが
+# 「Failed to load native module: pty.node」で失敗する（CachyOS 最小構成で発生）。
 ensure_deps() {
   local need=0
   command -v git >/dev/null 2>&1 || need=1
   command -v rsync >/dev/null 2>&1 || need=1
   command -v curl >/dev/null 2>&1 || need=1
   command -v python3 >/dev/null 2>&1 || need=1
+  command -v gcc >/dev/null 2>&1 || need=1
+  command -v make >/dev/null 2>&1 || need=1
+  command -v g++ >/dev/null 2>&1 || need=1
   if [ "${need}" -eq 0 ]; then return 0; fi
   info "不足している必須コマンドをインストールします..."
   if [ "${IS_ARCH}" -eq 1 ]; then
-    pacman -Sy --needed --noconfirm git rsync curl python
+    pacman -Sy --needed --noconfirm git rsync curl python base-devel
   else
     apt-get update -qq
-    DEBIAN_FRONTEND=noninteractive apt-get install -y -qq git rsync curl python3
+    DEBIAN_FRONTEND=noninteractive apt-get install -y -qq git rsync curl python3 build-essential
   fi
 }
 
@@ -162,6 +168,28 @@ info "OnlyOffice はインストールしません"
 info "npm install 実行中..."
 cd "${INSTALL_DIR}/server"
 npm install --omit=dev 2>&1 | tail -3
+# ── node-pty ネイティブビルドの確実化 ─────────────────────────────────────────
+# node-pty は Linux 用 prebuild を同梱しないため、node-gyp でのコンパイルが必須。
+# npm v11 以降は install scripts が既定でブロックされるため、明示的に許可して
+# rebuild する。許可なくスキップされると pty.node が生成されず、ターミナルが
+# 「Failed to load native module: pty.node」で失敗する（CachyOS で発生を確認）。
+if npm install-scripts ls 2>/dev/null | grep -q "node-pty"; then
+  info "node-pty の install script を許可して rebuild します..."
+  npm install-scripts approve --no-allow-scripts-pin node-pty 2>&1 | tail -2 || true
+  npm rebuild node-pty 2>&1 | tail -3 || true
+fi
+if [ ! -f "${INSTALL_DIR}/server/node_modules/node-pty/build/Release/pty.node" ]; then
+  warn "pty.node が見つかりません。node-gyp で直接ビルドを試みます..."
+  (cd "${INSTALL_DIR}/server/node_modules/node-pty" && npx --yes node-gyp rebuild 2>&1 | tail -5) || true
+fi
+if [ -f "${INSTALL_DIR}/server/node_modules/node-pty/build/Release/pty.node" ]; then
+  ok "node-pty ビルド確認 OK"
+else
+  warn "node-pty のビルドに失敗しました。ターミナルが使えません。"
+  warn "ビルドツール (Arch: base-devel python / Debian: build-essential python3) を確認し、"
+  warn "  cd ${INSTALL_DIR}/server && npm install-scripts approve node-pty && npm rebuild node-pty"
+  warn "を実行してください。"
+fi
 ok "npm install 完了"
 
 # ── systemd サービス作成 ─────────────────────────────────────────────────────
@@ -233,7 +261,7 @@ fi
 # ── 完了サマリー ──────────────────────────────────────────────────────────────
 echo ""
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-ok "selfEx v2.2.0 セットアップ完了！"
+ok "selfEx v2.2.4 セットアップ完了！"
 echo ""
 if [ -n "${TS_HOSTNAME}" ]; then
   echo "  selfEx : https://${TS_HOSTNAME}:${PORT}"

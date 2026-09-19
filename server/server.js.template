@@ -2742,6 +2742,20 @@ const termSessions = new Map();
 const TERM_BUF_MAX = 512 * 1024;
 const TERM_WELCOME = '\r\n\x1b[90m— selfEx terminal —\x1b[0m\r\n';
 
+/* node-pty 読み込み失敗時の対処ヒント。
+   Linux 版 node-pty は prebuild を同梱しないため node-gyp ビルドが必須。
+   npm v11+ は install scripts を既定ブロックするため、許可なしでは pty.node が
+   生成されず「Failed to load native module: pty.node」になる。 */
+function termPtyErrorHint(e) {
+  const msg = String((e && e.message) || e || '');
+  if (/Failed to load native module|pty\.node|Cannot find module/.test(msg)) {
+    return msg + '\n対処: cd ' + path.join(__dirname) +
+      ' && npm install-scripts approve node-pty && npm rebuild node-pty' +
+      '（ビルドツールが必要: Arch系は base-devel python / Debian系は build-essential python3）';
+  }
+  return msg;
+}
+
 function termSpawn(rec, dir) {
   const nodePty = require('node-pty');
   const old = rec.term;
@@ -2800,7 +2814,7 @@ termWss.on('connection', (ws, req) => {
       termSessions.set(id, rec);
       termSpawn(rec, startDir);
     } catch (e) {
-      ws.send(JSON.stringify({ type: 'data', data: '\r\n\x1b[31m[selfEx] ' + (e.message || e) + '\x1b[0m\r\n' }));
+      ws.send(JSON.stringify({ type: 'data', data: '\r\n\x1b[31m[selfEx] ' + termPtyErrorHint(e) + '\x1b[0m\r\n' }));
       try { ws.close(); } catch (err) {}
       return;
     }
@@ -2835,6 +2849,11 @@ termWss.on('connection', (ws, req) => {
 termServer.listen(PORT, HOST, () => {
   console.log(`selfEx listening on http://${HOST}:${PORT}`);
   console.log(`Root: ${ROOT_DIR}`);
+  /* node-pty の事前チェック。ビルド漏れがあれば起動ログに警告して早期発見する */
+  try { require('node-pty'); }
+  catch (e) {
+    console.error('[selfEx] WARNING: node-pty が読み込めません。ターミナルは使えません: ' + termPtyErrorHint(e));
+  }
   /* OnlyOffice 用のブリッジ待受を復元（設定済み環境向け。失敗しても起動は継続） */
   (async () => { try { const b = await ooBridgeInfo(); if (b) ooEnsureBridgeListen(b.gateway); } catch (e) {} })();
   bootRestoreWeb();

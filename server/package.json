@@ -1,6 +1,6 @@
 {
   "name": "selfex",
-  "version": "2.2.3",
+  "version": "2.2.4",
   "description": "selfEx - Modern file manager with SVG icons",
   "main": "server.js",
   "scripts": {
@@ -15,5 +15,8 @@
     "node-pty": "^1.0.0",
     "@xterm/xterm": "^5.5.0",
     "@xterm/addon-fit": "^0.10.0"
+  },
+  "allowScripts": {
+    "node-pty": true
   }
 }

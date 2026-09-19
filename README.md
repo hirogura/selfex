@@ -175,4 +175,4 @@ sudo rm -rf /opt/onlyoffice
 
 ## バージョン
 
-v.2.1.2
+v.2.1.3

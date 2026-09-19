@@ -41,6 +41,47 @@ function sh(cmd, args, opts = {}) {
   });
 }
 
+/* ── OS 判別（Debian 系 / Arch 系 = CachyOS 含む）とパッケージ導入 ── */
+let OS_INFO = null;
+function osInfo() {
+  if (OS_INFO) return OS_INFO;
+  const info = { id: '', like: '', isArch: false };
+  try {
+    const txt = fs.readFileSync('/etc/os-release', 'utf8');
+    for (const line of txt.split('\n')) {
+      const m = line.match(/^(ID|ID_LIKE)=(.*)$/);
+      if (!m) continue;
+      const v = m[2].trim().replace(/^"|"$/g, '').toLowerCase();
+      if (m[1] === 'ID') info.id = v; else info.like = v;
+    }
+  } catch (e) {}
+  if (info.id === 'arch' || info.id === 'cachyos' ||
+      /\barch\b/.test(info.like) || /\bcachyos\b/.test(info.like)) {
+    info.isArch = true;
+  } else {
+    try { if (fs.existsSync('/usr/bin/pacman')) info.isArch = true; } catch (e) {}
+  }
+  OS_INFO = info;
+  return info;
+}
+
+/* ディストリビューションに応じたパッケージ導入。Debian 系は apt、Arch 系は pacman。 */
+async function pkgInstall(pkgs, opts = {}) {
+  const names = Array.isArray(pkgs) ? pkgs : [pkgs];
+  const timeout = opts.timeout || 1800000;
+  if (osInfo().isArch) {
+    const map = { samba: 'samba', sshpass: 'sshpass', rsync: 'rsync', docker: 'docker', 'docker-compose': 'docker-compose', openssh: 'openssh' };
+    await sh('pacman', ['-S', '--needed', '--noconfirm'].concat(names.map(n => map[n] || n)), { timeout });
+  } else {
+    await sh('apt-get', ['update'], { timeout: 600000 });
+    await sh('bash', ['-c', 'DEBIAN_FRONTEND=noninteractive apt-get install -y ' + names.join(' ')], { timeout });
+  }
+}
+
+function pkgInstallHint(pkg) {
+  return osInfo().isArch ? ('sudo pacman -S ' + pkg) : ('sudo apt install ' + pkg);
+}
+
 async function ooHealthy() {
   try {
     const r = await fetch('http://127.0.0.1:' + OO_PORT + '/healthcheck', { signal: AbortSignal.timeout(2500) });
@@ -917,7 +958,11 @@ app.get('/api/onlyoffice/install', (req, res) => {
       try { await sh('docker', ['version', '--format', 'ok'], { timeout: 10000 }); dockerOk = true; } catch (e) {}
       if (!dockerOk) {
         log('Docker が見つかりません。インストール中...（数分かかります）');
-        await sh('bash', ['-c', 'curl -fsSL https://get.docker.com | sh'], { timeout: 900000 });
+        if (osInfo().isArch) {
+          await pkgInstall(['docker', 'docker-compose']);
+        } else {
+          await sh('bash', ['-c', 'curl -fsSL https://get.docker.com | sh'], { timeout: 900000 });
+        }
         await sh('systemctl', ['enable', '--now', 'docker'], { timeout: 60000 }).catch(() => {});
         if (!(await ooDockerDaemonReady(60000))) throw new Error('Docker デーモンの起動に失敗しました');
         log('Docker のインストールが完了しました');
@@ -1513,11 +1558,18 @@ function smbIsInstalled() {
   return false;
 }
 
+/* Samba のサービス名は OS で異なる。Debian 系は smbd、Arch 系（CachyOS 含む）は smb/nmb */
+function smbServiceNames() {
+  return osInfo().isArch ? ['smb', 'nmb'] : ['smbd'];
+}
+
 async function smbDaemonActive() {
-  try {
-    await sh('systemctl', ['is-active', '--quiet', 'smbd'], { timeout: 10000 });
-    return true;
-  } catch (e) {}
+  for (const svc of smbServiceNames()) {
+    try {
+      await sh('systemctl', ['is-active', '--quiet', svc], { timeout: 10000 });
+      return true;
+    } catch (e) {}
+  }
   try {
     const r = await sh('pgrep', ['smbd'], { timeout: 10000 });
     return r.stdout.trim().length > 0;
@@ -1526,13 +1578,33 @@ async function smbDaemonActive() {
 }
 
 async function smbAutostartEnabled() {
-  try {
-    const r = await sh('systemctl', ['is-enabled', 'smbd'], { timeout: 10000 });
-    return r.stdout.trim() === 'enabled';
-  } catch (e) {
-    if (e && e.stdout && String(e.stdout).trim() === 'enabled') return true;
+  for (const svc of smbServiceNames()) {
+    try {
+      const r = await sh('systemctl', ['is-enabled', svc], { timeout: 10000 });
+      if (r.stdout.trim() === 'enabled') return true;
+    } catch (e) {
+      if (e && e.stdout && String(e.stdout).trim() === 'enabled') return true;
+    }
   }
   return false;
+}
+
+/* Samba 関連サービスを有効化＋起動する（失敗したサービスは無視） */
+async function smbEnableStart() {
+  let ok = false;
+  for (const svc of smbServiceNames()) {
+    try { await sh('systemctl', ['enable', '--now', svc], { timeout: 60000 }); ok = true; } catch (e) {}
+  }
+  if (!ok && !osInfo().isArch) {
+    try { await sh('service', ['smbd', 'start'], { timeout: 60000 }); ok = true; } catch (e) {}
+  }
+  return ok;
+}
+
+async function smbSetAutostart(on) {
+  for (const svc of smbServiceNames()) {
+    try { await sh('systemctl', [on ? 'enable' : 'disable', svc], { timeout: 30000 }); } catch (e) {}
+  }
 }
 
 function smbReadState() {
@@ -1592,12 +1664,20 @@ async function smbSambaUserExists(username) {
   } catch (e) { return false; }
 }
 
+/* ログイン不可シェルの実在パスを返す（Arch 系は /usr/bin/nologin） */
+function smbLoginShell() {
+  for (const p of ['/usr/sbin/nologin', '/usr/bin/nologin']) {
+    try { if (fs.statSync(p).isFile()) return p; } catch (e) {}
+  }
+  return '/bin/false';
+}
+
 async function smbEnsureSystemUser(username) {
   try {
     await sh('id', [username], { timeout: 10000 });
     return;
   } catch (e) {}
-  await sh('useradd', ['-M', '-s', '/usr/sbin/nologin', username], { timeout: 30000 });
+  await sh('useradd', ['-M', '-s', smbLoginShell(), username], { timeout: 30000 });
 }
 
 function smbSetPassword(username, password) {
@@ -1621,11 +1701,19 @@ async function smbReload() {
     await sh('smbcontrol', ['all', 'reload-config'], { timeout: 30000 });
     return;
   } catch (e) {}
-  try {
-    await sh('systemctl', ['reload', 'smbd'], { timeout: 30000 });
-    return;
-  } catch (e) {}
-  await sh('systemctl', ['restart', 'smbd'], { timeout: 60000 });
+  for (const svc of smbServiceNames()) {
+    try {
+      await sh('systemctl', ['reload', svc], { timeout: 30000 });
+      return;
+    } catch (e) {}
+  }
+  for (const svc of smbServiceNames()) {
+    try {
+      await sh('systemctl', ['restart', svc], { timeout: 60000 });
+      return;
+    } catch (e) {}
+  }
+  throw new Error('Samba サービスの再起動に失敗しました');
 }
 
 function smbEnsureInclude() {
@@ -1641,7 +1729,17 @@ function smbEnsureInclude() {
 async function smbServerIps() {
   try {
     const r = await sh('hostname', ['-I'], { timeout: 10000 });
-    return r.stdout.split(/\s+/).map(s => s.trim()).filter(s => s && !s.startsWith('127.'));
+    const ips = r.stdout.split(/\s+/).map(s => s.trim()).filter(s => s && !s.startsWith('127.'));
+    if (ips.length) return ips;
+  } catch (e) {}
+  /* hostname コマンドが無い環境（Arch 系の最小構成など）は ip コマンドで取得 */
+  try {
+    const r = await sh('ip', ['-o', '-4', 'addr', 'show'], { timeout: 10000 });
+    const ips = [];
+    for (const m of r.stdout.matchAll(/inet\s+(\d+\.\d+\.\d+\.\d+)/g)) {
+      if (!m[1].startsWith('127.')) ips.push(m[1]);
+    }
+    return ips;
   } catch (e) { return []; }
 }
 
@@ -1718,16 +1816,17 @@ app.get('/api/samba/install', (req, res) => {
   (async () => {
     try {
       log('Samba のセットアップを開始します');
-      log('パッケージリストを更新中...');
-      await sh('apt-get', ['update'], { timeout: 600000 });
-      log('Samba をインストール中...（数分かかる場合があります）');
-      await sh('bash', ['-c', 'DEBIAN_FRONTEND=noninteractive apt-get install -y samba'], { timeout: 1800000 });
-      log('smbd を有効化・起動中...');
-      try {
-        await sh('systemctl', ['enable', '--now', 'smbd'], { timeout: 60000 });
-      } catch (e) {
-        await sh('service', ['smbd', 'start'], { timeout: 60000 }).catch(() => {});
+      if (osInfo().isArch) {
+        log('pacman で Samba をインストール中...（数分かかる場合があります）');
+        await pkgInstall(['samba']);
+      } else {
+        log('パッケージリストを更新中...');
+        await sh('apt-get', ['update'], { timeout: 600000 });
+        log('Samba をインストール中...（数分かかる場合があります）');
+        await sh('bash', ['-c', 'DEBIAN_FRONTEND=noninteractive apt-get install -y samba'], { timeout: 1800000 });
       }
+      log('Samba サービスを有効化・起動中...');
+      await smbEnableStart();
       smbEnsureInclude();
       log('設定ファイルの include を確認しました');
       log('Samba のインストールが完了しました！');
@@ -1780,9 +1879,7 @@ app.post('/api/samba/start', async (req, res) => {
         throw new Error('smb.conf の検証に失敗しました: ' + ((e.stderr || e.message || '').toString().slice(0, 300)));
       }
       try { fs.chmodSync(abs, 0o755); } catch (e) {}
-      try {
-        await sh('systemctl', ['enable', '--now', 'smbd'], { timeout: 60000 });
-      } catch (e) {}
+      await smbEnableStart();
       await smbReload();
       smbWriteState({ folder, share, username: guestOk ? '' : username, guestOk, readonly, enabled: true });
       const ips = await smbServerIps();
@@ -1827,7 +1924,7 @@ app.post('/api/samba/autostart', async (req, res) => {
   try {
     if (!smbIsInstalled()) return sendErr(res, 'Samba がインストールされていません');
     const on = !(req.body && req.body.enabled === false);
-    await sh('systemctl', [on ? 'enable' : 'disable', 'smbd'], { timeout: 30000 });
+    await smbSetAutostart(on);
     res.json({ success: true, autostart: on });
   } catch (e) {
     sendErr(res, e.message, e.status || 500);
@@ -2064,7 +2161,7 @@ function bkSshDiag(ssh) {
 function bkSshHint(ssh, diag) {
   const hints = [];
   if (diag.passwordSet && !diag.sshpassAvailable) {
-    hints.push('パスワードが入力されていますが sshpass が無いためパスワード認証に使われていません (apt install sshpass が必要)。');
+    hints.push('パスワードが入力されていますが sshpass が無いためパスワード認証に使われていません (' + pkgInstallHint('sshpass') + ' が必要)。');
   }
   const k = diag.key || {};
   if (k.specified) {
@@ -2088,7 +2185,7 @@ async function bkTestSsh(ssh) {
   if (!bkHas('ssh')) return { ok: false, error: 'ssh not found' };
   const diag = bkSshDiag(ssh);
   if (diag.passwordSet && !diag.sshpassAvailable) {
-    return { ok: false, error: 'パスワード認証できません: sshpass が未導入のため無視されます。apt install sshpass で導入するか、鍵認証を使ってください。', diagnostics: diag , needSshpassInstall: true };
+    return { ok: false, error: 'パスワード認証できません: sshpass が未導入のため無視されます。' + pkgInstallHint('sshpass') + ' で導入するか、鍵認証を使ってください。', diagnostics: diag , needSshpassInstall: true };
   }
   const dest = bkSshDest(ssh);
   try {
@@ -2212,7 +2309,7 @@ async function bkRunOnce(detail) {
   bkRunning = true;
   const started = Date.now() / 1000;
   try {
-    if (!bkHas('rsync')) return bkFinish(false, -1, 'rsync not found (apt install rsync で導入してください)', started, detail);
+    if (!bkHas('rsync')) return bkFinish(false, -1, 'rsync not found (' + pkgInstallHint('rsync') + ' で導入してください)', started, detail);
     const cfg = bkLoad();
     const err = bkValidate(cfg, true);
     if (err) return bkFinish(false, -1, 'invalid config: ' + err, started, detail);
@@ -2439,8 +2536,7 @@ app.post('/api/backup/sshpass/install', async (req, res) => {
     if (bkSshpassInstalling) return sendErr(res, 'インストールがすでに進行中です', 409);
     bkSshpassInstalling = true;
     try {
-      await sh('apt-get', ['update'], { timeout: 600000 });
-      await sh('bash', ['-c', 'DEBIAN_FRONTEND=noninteractive apt-get install -y sshpass'], { timeout: 1800000 });
+      await pkgInstall(['sshpass']);
       if (!bkHas('sshpass')) return sendErr(res, 'インストールを実行しましたが sshpass が見つかりません');
       res.json({ success: true, message: 'sshpass をインストールしました' });
     } finally {

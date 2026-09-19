@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # =============================================================================
-#  selfEx v2.1.3 セットアップスクリプト（GitHub版）
+#  selfEx v2.2.0 セットアップスクリプト（GitHub版）
 #  - https://github.com/hirogura/selfex からクローン
 #  - /opt/selfex に配置、/ をブラウズ対象
 #  - ポート 3362 / systemd サービス / Tailscale Serve 対応（Tailnet内のみHTTPS公開）
@@ -23,6 +23,41 @@ ok()    { echo -e "\033[1;32m[ OK ]\033[0m  $*"; }
 warn()  { echo -e "\033[1;33m[WARN]\033[0m  $*"; }
 die()   { echo -e "\033[1;31m[ERR ]\033[0m  $*" >&2; exit 1; }
 
+# ── OS 判別（Debian 系 / Arch 系 = CachyOS 含む） ──────────────────────────────
+OS_ID=""; OS_LIKE=""
+if [ -f /etc/os-release ]; then
+  # shellcheck disable=SC1091
+  . /etc/os-release
+  OS_ID="${ID:-}"; OS_LIKE="${ID_LIKE:-}"
+fi
+IS_ARCH=0
+case " ${OS_ID} ${OS_LIKE} " in
+  *" cachyos "*|*" arch "*) IS_ARCH=1 ;;
+esac
+if [ "${IS_ARCH}" -eq 0 ] && command -v pacman >/dev/null 2>&1; then IS_ARCH=1; fi
+if [ "${IS_ARCH}" -eq 1 ]; then
+  info "Arch 系 OS を検出 (ID=${OS_ID:-unknown})。pacman を使用します"
+else
+  info "Debian 系 OS として処理します (ID=${OS_ID:-unknown})"
+fi
+
+# ── 必須コマンドの自動インストール（git / rsync / curl / python3） ─────────────
+ensure_deps() {
+  local need=0
+  command -v git >/dev/null 2>&1 || need=1
+  command -v rsync >/dev/null 2>&1 || need=1
+  command -v curl >/dev/null 2>&1 || need=1
+  command -v python3 >/dev/null 2>&1 || need=1
+  if [ "${need}" -eq 0 ]; then return 0; fi
+  info "不足している必須コマンドをインストールします..."
+  if [ "${IS_ARCH}" -eq 1 ]; then
+    pacman -Sy --needed --noconfirm git rsync curl python
+  else
+    apt-get update -qq
+    DEBIAN_FRONTEND=noninteractive apt-get install -y -qq git rsync curl python3
+  fi
+}
+
 # ── Node.js 自動インストール ──────────────────────────────────────────────────
 install_nodejs() {
   info "Node.js をインストール中..."
@@ -43,8 +78,8 @@ install_nodejs() {
     info "Alpine Linux を検出。apk からインストールします..."
     apk add --no-cache nodejs npm
   elif command -v pacman >/dev/null 2>&1; then
-    info "Arch Linux を検出。pacman からインストールします..."
-    pacman -S --noconfirm nodejs npm
+    info "Arch 系 Linux（CachyOS 等）を検出。pacman からインストールします..."
+    pacman -Sy --needed --noconfirm nodejs npm
   elif command -v zypper >/dev/null 2>&1; then
     info "openSUSE を検出。zypper からインストールします..."
     zypper install -y nodejs npm
@@ -80,6 +115,7 @@ if [ "$NODE_VERSION" -lt "$NODE_MIN_VERSION" ]; then
   install_nodejs
 fi
 command -v npm >/dev/null 2>&1 || die "npm が見つかりません"
+ensure_deps
 command -v git >/dev/null 2>&1 || die "git が見つかりません"
 ok "前提 OK (Node.js v$(node -v), git 利用可)"
 
@@ -197,7 +233,7 @@ fi
 # ── 完了サマリー ──────────────────────────────────────────────────────────────
 echo ""
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-ok "selfEx v2.1.3 セットアップ完了！"
+ok "selfEx v2.2.0 セットアップ完了！"
 echo ""
 if [ -n "${TS_HOSTNAME}" ]; then
   echo "  selfEx : https://${TS_HOSTNAME}:${PORT}"

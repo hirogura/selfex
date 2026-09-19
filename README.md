@@ -60,6 +60,25 @@ sudo tailscale serve --bg --https=3362 "http://127.0.0.1:3362"
 
 `install-selfex1.sh` をダウンロードして実行するか、上記のクイックインストールコマンドを実行してください。
 
+### CachyOS へのインストール
+
+CachyOS（Arch 系）にも対応しています。インストールスクリプトは OS を自動判別し、パッケージ導入に `pacman` を使います。事前に以下を準備してください。
+
+```bash
+# 1. 必須パッケージを導入（git / Node.js / Tailscale）
+sudo pacman -Sy --needed git nodejs npm tailscale
+
+# 2. クイックインストール（Debian 系と同じコマンド）
+sudo bash -c "$(curl -fsSL https://raw.githubusercontent.com/hirogura/selfex/main/install-selfex1.sh)"
+```
+
+CachyOS での注意点:
+
+- 不足している `rsync` / `curl` / `python` はスクリプトが `pacman` で自動導入します
+- Samba / Docker / sshpass は初回利用時にアプリ画面から導入できます（内部で `pacman -S` が実行されます）。Samba のサービス名は `smb` / `nmb` として扱われます
+- Tailscale を使う場合は `sudo systemctl enable --now tailscaled` でデーモンを起動しておいてください
+- Docker を使う場合は `sudo systemctl enable --now docker` でデーモンを起動しておいてください（アプリ画面からの導入時は自動で有効化されます）
+
 ## OnlyOffice フォント追加（オプション）
 
 OnlyOffice で日本語などのフォントを正しく表示するには、`/Fonts/` にフォントファイル（ttf / otf / woff / woff2）を配置してから、以下のスクリプトを実行します。
@@ -175,4 +194,4 @@ sudo rm -rf /opt/onlyoffice
 
 ## バージョン
 
-v.2.1.3
+v.2.2.0

@@ -2086,7 +2086,8 @@ app.post('/api/samba/autostart', async (req, res) => {
 });
 
 /* ── バックアップ（rsync + SSH。selfphoto のバックアップ機能と同方式） ──
-   ソース複数・ターゲット1箇所。フォルダ構成を維持するため
+   ソース複数・ターゲット1箇所。ソースが1件のみの場合はそのフォルダを起点として
+   ターゲット直下に同期し、複数件の場合はフォルダ構成を維持するため
    ターゲット配下にソース相対パスごとにコピーする。
    固定オプション: -r -t -u -v --progress（除外: .upload-tmp/）。
    ミラーリングON時は --delete を追加し、ソースに無いファイルを削除する。 */
@@ -2398,7 +2399,14 @@ function bkBuildJobs(cfg) {
   const ssh = cfg.ssh || {};
   const useSsh = !!(ssh.enabled && String(ssh.host || '').trim());
   const tgt = String(cfg.target || '').trim();
-  return (cfg.sources || []).map(rel => {
+  const sources = cfg.sources || [];
+  /* ソースが1件のみの場合はそのフォルダを起点とし、ターゲット直下に同期する。
+     （例: ソース opt/lxd-data/test → ターゲット /opt/lxd-data/test 直下に中身を同期。
+     従来はターゲット配下にソース相対パスを付加していたため
+     /opt/lxd-data/test/opt/lxd-data/test となっていた）
+     複数件の場合は従来通りターゲット配下にソース相対パスごとにコピーする。 */
+  const single = sources.length === 1;
+  return sources.map(rel => {
     const srcAbs = path.join(ROOT_DIR, rel) + '/';
     let dest, sshCmd = null, envAdd = {};
     if (useSsh) {
@@ -2411,12 +2419,12 @@ function bkBuildJobs(cfg) {
       const user = String(ssh.user || '').trim();
       const prefix = user ? (user + '@') : '';
       const remoteBase = bkParseRemote(tgt).replace(/\/+$/, '');
-      const remoteDest = remoteBase + '/' + rel;
+      const remoteDest = single ? remoteBase : (remoteBase + '/' + rel);
       dest = prefix + String(ssh.host).trim() + ':' + remoteDest;
       const pw = String(ssh.password || '');
       if (pw && bkHas('sshpass')) envAdd.SSHPASS = pw;
     } else {
-      dest = path.join(tgt, rel) + '/';
+      dest = (single ? tgt : path.join(tgt, rel)) + '/';
     }
     let argv = ['rsync'].concat(BK_FIXED_OPTS).concat(['--exclude=' + BK_EXCLUDE]);
     if (cfg.mirror) argv.push('--delete');
@@ -2475,7 +2483,8 @@ async function bkRunOnce(detail) {
         try { fs.mkdirSync(job.dest, { recursive: true }); }
         catch (e) { allLog += '\n[' + job.rel + '] mkdir failed: ' + e.message + '\n'; fail++; continue; }
       } else {
-        const chk = await bkCheckTarget(cfg.target + '/' + job.rel, cfg.ssh, true);
+        const targetDir = (cfg.sources || []).length === 1 ? cfg.target : (cfg.target + '/' + job.rel);
+        const chk = await bkCheckTarget(targetDir, cfg.ssh, true);
         if (!chk.ok) { allLog += '\n[' + job.rel + '] target check failed: ' + chk.error + '\n'; fail++; continue; }
       }
       allLog += '\n$ ' + job.argv.join(' ') + '\n';

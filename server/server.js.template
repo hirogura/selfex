@@ -833,7 +833,72 @@ app.get('/api/groups', async (req, res) => {
   }
 });
 
-app.get('/api/onlyoffice/config', (req, res) => {
+/* ── OnlyOffice コンテナ → selfEx の到達性 ──
+   DocumentServer（コンテナ）は document.url / callbackUrl をサーバー側で取得する。
+   selfEx は 127.0.0.1 のみで待受するため、そのままではコンテナから届かない。
+   また Tailnet の公開 URL は、コンテナ内では名前解決・tailscale のパケットフィルタ・
+   ホストのファイアウォールにより到達できず、ETIMEDOUT で開いたままになる。
+   そのため DocumentServer 用の URL には、コンテナと同居する Docker ネットワークの
+   ゲートウェイ IP（ホストのブリッジ側アドレス）を使い、selfEx 側も同アドレスで
+   追加待受＋ファイアウォール許可を行う。ブラウザが使う editorUrl は従来通り。 */
+const OO_NET_NAME = 'onlyoffice_default';
+const ooBridgeServers = {};
+
+async function ooBridgeInfo() {
+  /* { gateway, subnet } を返す。取得できなければ null */
+  try {
+    const r = await sh('docker', ['network', 'inspect', OO_NET_NAME], { timeout: 15000 });
+    const arr = JSON.parse(r.stdout);
+    const cfg = arr && arr[0] && arr[0].IPAM && arr[0].IPAM.Config && arr[0].IPAM.Config[0];
+    if (cfg && cfg.Gateway && cfg.Subnet) return { gateway: cfg.Gateway, subnet: cfg.Subnet };
+  } catch (e) {}
+  return null;
+}
+
+function ooEnsureBridgeListen(ip) {
+  if (!ip || ooBridgeServers[ip]) return;
+  try {
+    const srv = http.createServer(app);
+    srv.on('error', () => {});
+    srv.listen(PORT, ip, () => console.log('selfEx additionally listening on http://' + ip + ':' + PORT + ' (docker bridge)'));
+    ooBridgeServers[ip] = srv;
+  } catch (e) {}
+}
+
+async function ooEnsureContainerFw(log) {
+  /* Docker ブリッジ上のコンテナから selfEx (PORT) への到達を許可する。
+     ufw が有効な環境では既定 deny によりコンテナ→ホストが遮断される。 */
+  const info = await ooBridgeInfo();
+  if (!info) {
+    if (log) log('警告: Docker ネットワーク情報を取得できませんでした');
+    return false;
+  }
+  let ufwActive = false;
+  try { ufwActive = (await sh('ufw', ['status'], { timeout: 10000 })).stdout.includes('Status: active'); } catch (e) {}
+  if (ufwActive) {
+    try {
+      const st = (await sh('ufw', ['status'], { timeout: 10000 })).stdout;
+      if (st.includes(info.subnet) && new RegExp(String(PORT) + '/tcp').test(st)) {
+        if (log) log('ファイアウォール (ufw) のコンテナ用許可は設定済みです');
+      } else {
+        if (log) log('ファイアウォール (ufw) にコンテナ用アクセス許可を追加します: ' + info.subnet + ' → port ' + PORT);
+        await sh('ufw', ['allow', 'from', info.subnet, 'to', 'any', 'port', String(PORT), 'proto', 'tcp'], { timeout: 30000 });
+      }
+    } catch (e) { if (log) log('警告: ufw 設定に失敗しました: ' + (e.message || String(e))); }
+  } else {
+    try {
+      await sh('iptables', ['-C', 'INPUT', '-s', info.subnet, '-p', 'tcp', '--dport', String(PORT), '-j', 'ACCEPT'], { timeout: 10000 });
+    } catch (e) {
+      try {
+        if (log) log('ファイアウォール (iptables) にコンテナ用アクセス許可を追加します: ' + info.subnet + ' → port ' + PORT);
+        await sh('iptables', ['-I', 'INPUT', '-s', info.subnet, '-p', 'tcp', '--dport', String(PORT), '-j', 'ACCEPT'], { timeout: 30000 });
+      } catch (e2) { if (log) log('警告: iptables 設定に失敗しました: ' + (e2.message || String(e2))); }
+    }
+  }
+  return true;
+}
+
+app.get('/api/onlyoffice/config', async (req, res) => {
   try {
     const filePath = String(req.query.path || '');
     const abs = safeResolve(filePath);
@@ -844,7 +909,14 @@ app.get('/api/onlyoffice/config', (req, res) => {
     const proto = publicProto(req);
     const host = publicHost(req);
     const editorUrl = ONLYOFFICE_URL || (proto + '://' + swapPort(host, OO_PORT));
-    const base = docBase(req);
+    /* document.url / callbackUrl は DocumentServer コンテナが取得するため、
+       コンテナ到達可能なブリッジ経由 URL を使う（Tailnet 公開 URL はコンテナから届かない）。 */
+    let base = '';
+    try {
+      const binfo = await ooBridgeInfo();
+      if (binfo) { ooEnsureBridgeListen(binfo.gateway); base = 'http://' + binfo.gateway + ':' + PORT; }
+    } catch (e) {}
+    if (!base) base = docBase(req);
     const config = {
       document: {
         fileType: ext.replace('.', ''),
@@ -1033,6 +1105,18 @@ app.get('/api/onlyoffice/install', (req, res) => {
       log('OnlyOffice コンテナを起動中...');
       await sh(compose.cmd, compose.baseArgs.concat(['up', '-d']), { timeout: 600000, cwd: OO_DIR });
       send('progress', { message: 'コンテナを起動しました' });
+
+      /* コンテナから selfEx に到達できるよう設定（ブリッジ待受＋ファイアウォール）。
+         Docker ネットワークは up 後に確定するため、ここで行う。 */
+      log('コンテナから selfEx に到達できるよう設定中...');
+      try {
+        const binfo = await ooBridgeInfo();
+        if (binfo) {
+          ooEnsureBridgeListen(binfo.gateway);
+          log('Docker ブリッジ (' + binfo.gateway + ') での待受を開始しました');
+        }
+      } catch (e) {}
+      await ooEnsureContainerFw(log);
 
       // ── Tailscale Serve 設定 ──
       try {
@@ -2707,6 +2791,8 @@ termWss.on('connection', (ws, req) => {
 termServer.listen(PORT, HOST, () => {
   console.log(`selfEx listening on http://${HOST}:${PORT}`);
   console.log(`Root: ${ROOT_DIR}`);
+  /* OnlyOffice 用のブリッジ待受を復元（設定済み環境向け。失敗しても起動は継続） */
+  (async () => { try { const b = await ooBridgeInfo(); if (b) ooEnsureBridgeListen(b.gateway); } catch (e) {} })();
   bootRestoreWeb();
   bkEnsureWatch();
 });

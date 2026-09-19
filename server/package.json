@@ -1,6 +1,6 @@
 {
   "name": "selfex",
-  "version": "2.2.5",
+  "version": "2.2.6",
   "description": "selfEx - Modern file manager with SVG icons",
   "main": "server.js",
   "scripts": {

@@ -129,6 +129,7 @@ body{font-family:"Segoe UI Variable","Segoe UI",system-ui,-apple-system,sans-ser
 .empty-state-icon{font-size:48px;margin-bottom:16px;opacity:.5}
 .file-item.dragging,.split-file-item.dragging{opacity:.5}
 .file-item.drag-over,.split-file-item.drag-over,.tree-item-content.drag-over{background:var(--accent-light)!important;color:var(--accent-color)!important;outline:2px dashed var(--accent-color);outline-offset:-2px}
+.file-list-wrapper.drag-over,.split-wrapper.drag-over{background:var(--accent-light)!important;outline:2px dashed var(--accent-color);outline-offset:-2px}
 /* ── 2分割表示（下ペイン） ── */
 .split-resize-handle{height:5px;flex-shrink:0;background:transparent;cursor:row-resize;transition:background .15s;position:relative;z-index:5;border-top:1px solid var(--border-color)}
 .split-resize-handle:hover,.split-resize-handle:active{background:var(--accent-color)}

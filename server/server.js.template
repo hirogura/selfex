@@ -1498,6 +1498,92 @@ app.get('/api/config', (req, res) => {
   res.json({ success: true, rootPrefix: ROOT_DIR });
 });
 
+/* ── お気に入り（サーバ側保持・全クライアント共有） ── */
+const FAV_FILE = '/var/lib/selfex/favorites.json';
+
+function favLoad() {
+  try {
+    const j = JSON.parse(fs.readFileSync(FAV_FILE, 'utf8'));
+    const list = Array.isArray(j) ? j : (Array.isArray(j.favorites) ? j.favorites : []);
+    const out = [];
+    const seen = new Set();
+    for (const f of list) {
+      const p = String((f && f.path) || '').trim().replace(/\\/g, '/').replace(/^\/+|\/+$/g, '');
+      if (!p || p === '.' || seen.has(p)) continue;
+      if (p.split('/').includes('..')) continue;
+      seen.add(p);
+      out.push({ path: p, name: String((f && f.name) || p.split('/').pop() || p) });
+    }
+    return out;
+  } catch (e) { return []; }
+}
+
+function favSave(list) {
+  try { fs.mkdirSync(path.dirname(FAV_FILE), { recursive: true }); } catch (e) {}
+  const tmp = FAV_FILE + '.tmp';
+  fs.writeFileSync(tmp, JSON.stringify(list, null, 2));
+  fs.renameSync(tmp, FAV_FILE);
+}
+
+app.get('/api/favorites', (req, res) => {
+  res.json({ success: true, favorites: favLoad() });
+});
+
+app.post('/api/favorites', (req, res) => {
+  try {
+    const raw = String((req.body && req.body.path) || '').trim().replace(/\\/g, '/').replace(/^\/+|\/+$/g, '');
+    if (!raw || raw === '.' || raw.split('/').includes('..')) return sendErr(res, 'パスが不正です');
+    let abs;
+    try { abs = safeResolve(raw); } catch (e) { return sendErr(res, 'パスが不正です'); }
+    try { if (!isDir(abs)) return sendErr(res, 'フォルダではありません'); } catch (e) { return sendErr(res, 'フォルダが見つかりません'); }
+    const name = String((req.body && req.body.name) || raw.split('/').pop() || raw);
+    const list = favLoad();
+    if (!list.some(f => f.path === raw)) {
+      list.push({ path: raw, name });
+      favSave(list);
+    }
+    res.json({ success: true, favorites: list });
+  } catch (e) {
+    sendErr(res, e.message, e.status || 500);
+  }
+});
+
+app.delete('/api/favorites', (req, res) => {
+  try {
+    const raw = String((req.body && req.body.path) || '').trim().replace(/\\/g, '/').replace(/^\/+|\/+$/g, '');
+    const list = favLoad().filter(f => f.path !== raw);
+    favSave(list);
+    res.json({ success: true, favorites: list });
+  } catch (e) {
+    sendErr(res, e.message, e.status || 500);
+  }
+});
+
+/* 全置換（初回マイグレーション・複数クライアントの同期用） */
+app.put('/api/favorites', (req, res) => {
+  try {
+    const input = Array.isArray(req.body.favorites) ? req.body.favorites : [];
+    const out = [];
+    const seen = new Set();
+    for (const f of input) {
+      const p = String((f && f.path) || '').trim().replace(/\\/g, '/').replace(/^\/+|\/+$/g, '');
+      if (!p || p === '.' || seen.has(p)) continue;
+      if (p.split('/').includes('..')) continue;
+      try {
+        const abs = safeResolve(p);
+        if (!fs.existsSync(abs) || !fs.statSync(abs).isDirectory()) continue;
+      } catch (e) { continue; }
+      seen.add(p);
+      out.push({ path: p, name: String((f && f.name) || p.split('/').pop() || p) });
+      if (out.length >= 500) break;
+    }
+    favSave(out);
+    res.json({ success: true, favorites: out });
+  } catch (e) {
+    sendErr(res, e.message, e.status || 500);
+  }
+});
+
 async function tailnetHostname() {
   try {
     const out = (await sh('tailscale', ['whoami', '--json'], { timeout: 10000 })).stdout;

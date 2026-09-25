@@ -1378,9 +1378,15 @@ app.get('/api/update', (req, res) => {
       }
       const needRestart = serverChanged;
       log(changed.length ? '更新ファイル: ' + changed.length + ' 件' : '更新はありません');
-      if (needRestart) log('サーバー側の変更があるため「再起動」が必要です');
-      send('done', { ok: true, changedFiles: changed.length, needRestart });
+      if (needRestart) log('サーバー側の変更があるため自動で再起動します...');
+      send('done', { ok: true, changedFiles: changed.length, needRestart, autoRestart: needRestart });
       upUpdating = false;
+      if (needRestart) {
+        setTimeout(() => {
+          try { regenerateServerFromTemplate(); } catch (e) {}
+          sh('systemctl', ['restart', OO_SERVICE_NAME]).catch(e => console.error('auto restart failed:', e.message));
+        }, 1000);
+      }
     });
     child.on('error', err => {
       send('done', { ok: false, error: err.message || String(err) });

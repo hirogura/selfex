@@ -10,7 +10,7 @@ const fs = require('fs');
 const crypto = require('crypto');
 const http = require('http');
 const WebSocket = require('ws');
-const { execFile } = require('child_process');
+const { execFile, execFileSync } = require('child_process');
 
 const PORT = parseInt(process.env.PORT || '__PORT__', 10);
 const OO_PORT = parseInt(process.env.ONLYOFFICE_PORT || '__OO_PORT__', 10);
@@ -3041,6 +3041,740 @@ app.post('/api/backup/target-check', async (req, res) => {
   } catch (e) { sendErr(res, e.message, e.status || 500); }
 });
 
+/* ── rclone（クラウドへのバックアップ。rcloneGUI の機能を selfEx に統合） ──
+   コピー元（ローカルフォルダ）は複数指定でき、転送先は rclone の
+   「リモート名:パス」1箇所のみ。各ソースはフォルダ名を保って転送先直下へ
+   コピーする。（例: ソース Photos/2026 → 転送先 gdrive:backup/2026）
+   固定オプション: --stats 2s --stats-one-line -v（除外: .upload-tmp/）。
+   ミラーリングON時は sync を使い、ソースに無いファイルを転送先で削除する。
+   スケジュール（間隔 / 指定時刻+曜日）の扱いはバックアップパネルと同一。 */
+const RC_FILE = '/var/lib/selfex/rclone.json';
+const RC_DIR = '/var/lib/selfex/rclone';
+const RC_CONF_PATH = path.join(RC_DIR, 'rclone.conf');
+const RC_JOBS_DIR = path.join(RC_DIR, 'jobs');
+const RC_SHARE_CONF = '/opt/rclonegui/config/rclone.conf';
+const RC_FIXED_OPTS = ['--stats', '2s', '--stats-one-line', '-v'];
+const RC_EXCLUDE = '.upload-tmp/';
+const RC_INTERVALS = BK_INTERVALS;
+const RC_DEFAULT_INTERVAL = BK_DEFAULT_INTERVAL;
+const RC_TIME_POLL_SEC = BK_TIME_POLL_SEC;
+const RC_REMOTE_TYPES = ['drive', 'onedrive'];
+const RC_JOB_RETENTION_DAYS = 30;
+const RC_TIMEOUT_MS = 30000;
+const RC_AUTH_TIMEOUT_MS = 300000;
+let rcRunning = false;
+let rcLastRun = null;
+let rcWatchTimer = null;
+let rcLastFiredMinute = null;
+let rcVersionCache = null;
+const rcAuthSessions = new Map();
+
+function rcEnsureDirs() {
+  try { fs.mkdirSync(RC_JOBS_DIR, { recursive: true }); } catch (e) {}
+  try {
+    /* 既存の rcloneGUI を使っている環境では、その設定を一度だけ取り込む */
+    if (!fs.existsSync(RC_CONF_PATH) && fs.existsSync(RC_SHARE_CONF)) {
+      fs.copyFileSync(RC_SHARE_CONF, RC_CONF_PATH);
+      try { fs.chmodSync(RC_CONF_PATH, 0o600); } catch (e) {}
+      console.log('[rclone] rcloneGUI の設定を取り込みました: ' + RC_SHARE_CONF);
+    }
+  } catch (e) {}
+}
+
+function rcReadConf() {
+  try { return fs.existsSync(RC_CONF_PATH) ? fs.readFileSync(RC_CONF_PATH, 'utf8') : ''; } catch (e) { return ''; }
+}
+
+function rcWriteConf(content) {
+  rcEnsureDirs();
+  const tmp = RC_CONF_PATH + '.tmp';
+  fs.writeFileSync(tmp, String(content).trim() + '\n');
+  fs.renameSync(tmp, RC_CONF_PATH);
+  try { fs.chmodSync(RC_CONF_PATH, 0o600); } catch (e) {}
+}
+
+function rcValidRemoteName(name) {
+  return typeof name === 'string' && /^[a-zA-Z0-9_-]+$/.test(name);
+}
+
+function rcValidJobId(id) {
+  return typeof id === 'string' && /^[a-zA-Z0-9_-]+$/.test(id);
+}
+
+/* rclone.conf を [名前] / key = value 形式で読み取る（rcloneGUI と同一方式） */
+function rcParseRemotes() {
+  const content = rcReadConf();
+  if (!content.trim()) return [];
+  const remotes = [];
+  let current = null;
+  for (const line of content.split('\n')) {
+    const m = line.match(/^\[(.+)\]$/);
+    if (m) {
+      if (current) remotes.push(current);
+      current = { name: m[1], type: '', params: {} };
+    } else if (current && line.includes('=')) {
+      const eq = line.indexOf('=');
+      const key = line.substring(0, eq).trim();
+      const val = line.substring(eq + 1).trim();
+      current.params[key] = val;
+      if (key === 'type') current.type = val;
+    }
+  }
+  if (current) remotes.push(current);
+  return remotes;
+}
+
+function rcRcloneEnv() {
+  return Object.assign({}, process.env, { RCLONE_CONFIG: RC_CONF_PATH });
+}
+
+function rcRcloneSync(args, timeoutMs) {
+  rcEnsureDirs();
+  try {
+    const out = execFileSync('rclone', args, {
+      timeout: timeoutMs || RC_TIMEOUT_MS, encoding: 'utf8',
+      env: rcRcloneEnv(), maxBuffer: 4 * 1024 * 1024
+    });
+    return { ok: true, data: String(out || '').trim() };
+  } catch (e) {
+    const msg = String(e.stdout || '').trim() || String(e.message || e);
+    return { ok: false, error: msg.trim().slice(0, 2000) };
+  }
+}
+
+function rcVersionText() {
+  if (rcVersionCache !== null) return rcVersionCache;
+  if (!bkHas('rclone')) { rcVersionCache = ''; return rcVersionCache; }
+  const r = rcRcloneSync(['version'], 10000);
+  let v = '';
+  if (r.ok) { const m = String(r.data).split('\n')[0].match(/v?([0-9][^\s-]*)/); v = m ? m[1] : ''; }
+  rcVersionCache = v;
+  return v;
+}
+
+/* 転送先（リモート:パス）の正規化・検証 */
+function rcNormRemotePath(p) {
+  const t = String(p == null ? '' : p).trim().replace(/^\/+|\/+$/g, '');
+  if (/[\r\n\0]/.test(t)) return null;
+  const parts = t.split('/').filter(x => x && x !== '.');
+  if (parts.includes('..')) return null;
+  return parts.join('/');
+}
+
+function rcDestBase(cfg) {
+  const name = String((cfg || {}).remote || '').trim();
+  const p = rcNormRemotePath((cfg || {}).remotePath) || '';
+  return p ? (name + ':' + p) : (name + ':');
+}
+
+function rcCheckRemote(cfg) {
+  const name = String((cfg || {}).remote || '').trim();
+  if (!name) return 'remote required';
+  if (!rcValidRemoteName(name)) return 'remote name invalid';
+  if (!rcParseRemotes().some(r => r.name === name)) return 'remote not found: ' + name;
+  if (rcNormRemotePath((cfg || {}).remotePath) === null) return 'remote path invalid';
+  return null;
+}
+
+function rcDefaultConfig() {
+  return {
+    sources: [],
+    remote: '',
+    remotePath: '',
+    deleteExtra: false,
+    watch: { enabled: false, mode: 'interval', intervalSec: RC_DEFAULT_INTERVAL,
+      times: BK_DEFAULT_TIMES.slice(), days: BK_DEFAULT_DAYS.slice() },
+    lastRun: null
+  };
+}
+
+function rcLoad() {
+  const cfg = rcDefaultConfig();
+  try {
+    if (fs.existsSync(RC_FILE)) {
+      const saved = JSON.parse(fs.readFileSync(RC_FILE, 'utf8'));
+      if (saved && typeof saved === 'object') {
+        if (Array.isArray(saved.sources)) cfg.sources = bkNormSources(saved.sources);
+        if (typeof saved.remote === 'string') cfg.remote = saved.remote.trim();
+        if (typeof saved.remotePath === 'string') cfg.remotePath = rcNormRemotePath(saved.remotePath) || '';
+        if ('deleteExtra' in saved) cfg.deleteExtra = !!saved.deleteExtra;
+        if (saved.watch && typeof saved.watch === 'object') {
+          cfg.watch = bkNormWatch(Object.assign({}, cfg.watch, saved.watch));
+        }
+        if (saved.lastRun && typeof saved.lastRun === 'object') { cfg.lastRun = saved.lastRun; }
+      }
+    }
+  } catch (e) {}
+  return cfg;
+}
+
+function rcSave(cfg) {
+  try { fs.mkdirSync(path.dirname(RC_FILE), { recursive: true }); } catch (e) {}
+  const tmp = RC_FILE + '.tmp';
+  fs.writeFileSync(tmp, JSON.stringify(cfg, null, 2));
+  fs.renameSync(tmp, RC_FILE);
+  try { fs.chmodSync(RC_FILE, 0o600); } catch (e) {}
+}
+
+/* 保存時は転送先未設定を許容。実行時は forRun=true で厳密に検証する */
+function rcValidate(cfg, forRun) {
+  for (const s of (cfg.sources || [])) {
+    const err = bkCheckSourceDir(s);
+    if (err) return err;
+  }
+  if (forRun && (!cfg.sources || !cfg.sources.length)) return 'source required';
+  const rerr = rcCheckRemote(cfg);
+  if (rerr) return rerr;
+  const w = bkNormWatch(cfg.watch || {});
+  if (!RC_INTERVALS.includes(w.intervalSec)) return 'bad interval';
+  if (w.mode === 'time') {
+    if (!w.times.length) return 'bad time';
+    for (const t of w.times) { if (!bkParseTime(t)) return 'bad time'; }
+    if (!w.days.length || w.days.some(d => !(d >= 0 && d <= 6))) return 'bad days';
+  }
+  return null;
+}
+
+/* 各ソースを起点に、転送先直下へ同名フォルダを作ってコピーするジョブを組む */
+function rcBuildJobs(cfg) {
+  const base = rcDestBase(cfg).replace(/\/+$/, '');
+  return (cfg.sources || []).map(rel => {
+    const srcAbs = path.join(ROOT_DIR, rel);
+    const dest = base.endsWith(':') ? (base + path.basename(rel)) : (base + '/' + path.basename(rel));
+    const mode = cfg.deleteExtra ? 'sync' : 'copy';
+    const args = [mode].concat(RC_FIXED_OPTS).concat(['--exclude', RC_EXCLUDE]).concat([srcAbs, dest]);
+    return { rel, srcAbs, dest, args, mode };
+  });
+}
+
+function rcSpawn(cmd, args, timeoutMs) {
+  return new Promise((resolve) => {
+    let child;
+    try {
+      child = spawn(cmd, args, { env: rcRcloneEnv() });
+    } catch (e) {
+      resolve({ code: -1, log: 'spawn failed: ' + (e.message || e) });
+      return;
+    }
+    let out = '';
+    const push = (d) => { out += d.toString(); if (out.length > 80000) out = out.slice(-80000); };
+    child.stdout.on('data', push);
+    child.stderr.on('data', push);
+    const to = setTimeout(() => { try { child.kill('SIGKILL'); } catch (e) {} }, timeoutMs || 6 * 3600 * 1000);
+    child.on('error', (e) => { clearTimeout(to); resolve({ code: -1, log: out + '\nspawn error: ' + (e.message || e) }); });
+    child.on('close', (code) => { clearTimeout(to); resolve({ code: code == null ? -1 : code, log: out }); });
+  });
+}
+
+/* ── ジョブ履歴（rcloneGUI と同じく JSON ファイルで保持） ── */
+function rcJobPath(id) { return path.join(RC_JOBS_DIR, id + '.json'); }
+
+function rcCleanupJobs() {
+  try {
+    const files = fs.readdirSync(RC_JOBS_DIR).filter(f => f.endsWith('.json'));
+    const cutoff = Date.now() - RC_JOB_RETENTION_DAYS * 24 * 60 * 60 * 1000;
+    for (const f of files) {
+      try {
+        const job = JSON.parse(fs.readFileSync(path.join(RC_JOBS_DIR, f), 'utf8'));
+        const created = new Date(job.createdAt || 0).getTime();
+        if (created < cutoff) fs.unlinkSync(path.join(RC_JOBS_DIR, f));
+      } catch (e) {}
+    }
+  } catch (e) {}
+}
+
+function rcListJobs() {
+  rcEnsureDirs();
+  rcCleanupJobs();
+  try {
+    return fs.readdirSync(RC_JOBS_DIR).filter(f => f.endsWith('.json')).map(f => {
+      try { return JSON.parse(fs.readFileSync(path.join(RC_JOBS_DIR, f), 'utf8')); } catch (e) { return null; }
+    }).filter(Boolean).sort((a, b) => new Date(b.createdAt || 0) - new Date(a.createdAt || 0));
+  } catch (e) { return []; }
+}
+
+function rcFinish(ok, exitCode, log, started, detail) {
+  rcLastRun = { ok, exitCode, startedAt: started, finishedAt: Date.now() / 1000, logTail: String(log || '').slice(-8000), detail: detail || '' };
+  try {
+    const cfg = rcLoad();
+    cfg.lastRun = rcLastRun;
+    rcSave(cfg);
+  } catch (e) {}
+  return Object.assign({}, rcLastRun);
+}
+
+async function rcRunOnce(detail) {
+  if (rcRunning) return { ok: false, alreadyRunning: true };
+  rcRunning = true;
+  const started = Date.now() / 1000;
+  try {
+    if (!bkHas('rclone')) return rcFinish(false, -1, 'rclone not found (' + pkgInstallHint('rclone') + ' で導入してください)', started, detail);
+    rcEnsureDirs();
+    const cfg = rcLoad();
+    const err = rcValidate(cfg, true);
+    if (err) return rcFinish(false, -1, 'invalid config: ' + err, started, detail);
+    const jobs = rcBuildJobs(cfg);
+    let allLog = '';
+    let fail = 0;
+    for (const job of jobs) {
+      const jobId = 'job_' + Date.now() + '_' + Math.floor(Math.random() * 9000 + 1000);
+      const rec = {
+        id: jobId, name: '/' + job.rel + ' → ' + job.dest, source: '/' + job.rel, dest: job.dest,
+        mode: job.mode, deleteExtra: job.mode === 'sync', status: 'running', log: '',
+        detail: detail || 'manual', createdAt: new Date().toISOString()
+      };
+      try { fs.writeFileSync(rcJobPath(jobId), JSON.stringify(rec, null, 2)); } catch (e) {}
+      allLog += '$ rclone ' + job.args.join(' ') + '\n';
+      const r = await rcSpawn('rclone', job.args);
+      allLog += r.log + '\n';
+      rec.status = r.code === 0 ? 'completed' : 'failed';
+      rec.completedAt = new Date().toISOString();
+      rec.exitCode = r.code;
+      rec.log = String(r.log || '').slice(-20000);
+      try { fs.writeFileSync(rcJobPath(jobId), JSON.stringify(rec, null, 2)); } catch (e) {}
+      if (r.code !== 0) fail++;
+    }
+    return rcFinish(fail === 0, fail === 0 ? 0 : 1, allLog || '(no output)', started, detail);
+  } finally {
+    rcRunning = false;
+  }
+}
+
+function rcRunAsync(detail) {
+  if (rcRunning) return { ok: false, alreadyRunning: true };
+  setImmediate(() => { rcRunOnce(detail || 'manual').catch(() => {}); });
+  return { ok: true, started: true };
+}
+
+function rcStatus() {
+  const cfg = rcLoad();
+  return {
+    rcloneAvailable: bkHas('rclone'),
+    rcloneVersion: rcVersionText(),
+    running: rcRunning,
+    watching: !!rcWatchTimer,
+    watch: cfg.watch,
+    sources: cfg.sources,
+    remote: cfg.remote,
+    remotePath: cfg.remotePath,
+    deleteExtra: !!cfg.deleteExtra,
+    dest: cfg.remote ? rcDestBase(cfg) : '',
+    remotes: rcParseRemotes().map(r => ({ name: r.name, type: r.type })),
+    fixedOptions: RC_FIXED_OPTS,
+    exclude: RC_EXCLUDE,
+    intervals: RC_INTERVALS,
+    lastRun: rcLastRun || cfg.lastRun || null
+  };
+}
+
+function rcCurrentWatch() {
+  try { return bkNormWatch(rcLoad().watch); } catch (e) { return bkNormWatch(null); }
+}
+
+function rcTimeTick() {
+  if (rcRunning) return;
+  let w;
+  try { w = rcCurrentWatch(); } catch (e) { return; }
+  if (!w.enabled || w.mode !== 'time') return;
+  const now = bkNowHM();
+  if (!bkTimeMatches(now.hm, now.wday, w.times, w.days)) return;
+  if (rcLastFiredMinute === now.key) return;
+  rcLastFiredMinute = now.key;
+  console.log('rclone watch-time matched ' + now.key + ' -> starting transfer');
+  rcRunOnce('watch-time').catch(() => {});
+}
+
+function rcSetWatch(enabled) {
+  if (rcWatchTimer) { clearInterval(rcWatchTimer); rcWatchTimer = null; }
+  if (enabled) {
+    const w = rcCurrentWatch();
+    if (w.mode === 'time') {
+      console.log('rclone watch-time started: times=' + w.times.join(',') + ' days=' + w.days.join(','));
+      rcWatchTimer = setInterval(rcTimeTick, RC_TIME_POLL_SEC * 1000);
+      rcTimeTick();
+    } else {
+      const sec = RC_INTERVALS.includes(w.intervalSec) ? w.intervalSec : RC_DEFAULT_INTERVAL;
+      rcWatchTimer = setInterval(() => { if (!rcRunning) rcRunOnce('watch').catch(() => {}); }, sec * 1000);
+    }
+  }
+  return { ok: true, watching: !!rcWatchTimer };
+}
+
+function rcEnsureWatch() {
+  try { if (rcLoad().watch.enabled) rcSetWatch(true); } catch (e) {}
+}
+
+/* ── OAuth 認証（rclone authorize。rcloneGUI と同一のトンネル方式） ── */
+const rcAuthProcs = new Set();
+function rcFetchDriveId(accessToken) {
+  return new Promise((resolve) => {
+    try {
+      const https = require('https');
+      const req = https.get('https://graph.microsoft.com/v1.0/me/drive', {
+        headers: { Authorization: 'Bearer ' + accessToken }, timeout: 10000
+      }, r => {
+        if (r.statusCode !== 200) { r.resume(); return resolve(null); }
+        let body = '';
+        r.on('data', d => { body += d; });
+        r.on('end', () => {
+          try {
+            const info = JSON.parse(body);
+            resolve(typeof info.id === 'string' ? info.id : null);
+          } catch (e) { resolve(null); }
+        });
+      });
+      req.on('error', () => resolve(null));
+      req.on('timeout', () => { req.destroy(); resolve(null); });
+    } catch (e) { resolve(null); }
+  });
+}
+
+/* 取得したトークンを rclone.conf のセクションとして書き込む */
+function rcWriteTokenToConfig(remoteName, type, token) {
+  const tokenStr = typeof token === 'string' ? token : JSON.stringify(token);
+  let content = rcReadConf();
+  const sectionRe = new RegExp('\\n?\\[' + remoteName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '\\][^\\[]*', 'g');
+  if (sectionRe.test(content)) {
+    content = content.replace(sectionRe, '').replace(/\n{3,}/g, '\n\n').trim();
+  }
+  let section = '\n[' + remoteName + ']\ntype = ' + type;
+  if (type === 'drive') {
+    section += '\nscope = drive';
+  } else if (type === 'onedrive') {
+    section += '\ndrive_type = personal';
+    /* drive_id は非同期で取得して追記する（トークンをシェルに渡さない） */
+    try {
+      const tokenObj = typeof token === 'string' ? JSON.parse(token) : token;
+      const accessToken = tokenObj && typeof tokenObj.access_token === 'string' ? tokenObj.access_token : null;
+      if (accessToken && /^[A-Za-z0-9\-._~+/=]+$/.test(accessToken)) {
+        rcFetchDriveId(accessToken).then(driveId => {
+          if (!driveId || !/^[A-Za-z0-9!._-]+$/.test(driveId)) return;
+          try {
+            let cur = rcReadConf();
+            const re = new RegExp('(\\[' + remoteName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '\\][^\\[]*?)(\\ntoken = )');
+            if (re.test(cur) && !cur.includes('drive_id = ' + driveId)) {
+              cur = cur.replace(re, '$1\ndrive_id = ' + driveId + '$2');
+              fs.writeFileSync(RC_CONF_PATH, cur);
+            }
+          } catch (e) {}
+        });
+      }
+    } catch (e) {}
+  }
+  section += '\ntoken = ' + tokenStr;
+  const sep = content.trim() ? '\n' : '';
+  rcWriteConf(content.trim() + sep + section);
+}
+
+function rcSh(cmd, args, timeoutMs) {
+  return new Promise((resolve) => {
+    execFile(cmd, args, { timeout: timeoutMs || 10000, maxBuffer: 1024 * 1024 }, (err, stdout, stderr) => {
+      if (err) {
+        err.stdout = stdout; err.stderr = stderr;
+        return resolve({ ok: false, error: String((stderr || '') + (err.message || '')).trim() });
+      }
+      resolve({ ok: true, data: String(stdout || '').trim() });
+    });
+  });
+}
+
+/* rclone authorize のリダイレクトは 127.0.0.1:53682 に来るため、
+   ブラウザから SSH トンネルを張れるよう root のパスワード認証を一時的に有効化する */
+async function rcSetupSsh() {
+  const pw = 'selfex' + Math.floor(Math.random() * 900000 + 100000);
+  await rcSh('bash', ['-c', 'echo "root:' + pw + '" | chpasswd'], 10000);
+  const conf = '/etc/ssh/sshd_config.d/60-cloudimg-settings.conf';
+  await rcSh('bash', ['-c', "if [ -f " + conf + " ]; then sed -i 's/^#*PasswordAuthentication.*/PasswordAuthentication yes/' " + conf + "; grep -q '^KbdInteractiveAuthentication yes$' " + conf + " || echo 'KbdInteractiveAuthentication yes' >> " + conf + "; grep -q '^PermitRootLogin yes$' " + conf + " || echo 'PermitRootLogin yes' >> " + conf + "; fi"], 8000);
+  await rcSh('bash', ['-c', 'systemctl restart sshd 2>/dev/null || systemctl restart ssh'], 15000);
+  const h = await rcSh('bash', ['-c', "hostname -I | awk '{print $1}'"], 5000);
+  return { success: true, password: pw, hostname: (h.ok && h.data) ? h.data : '' };
+}
+
+async function rcTeardownSsh() {
+  const conf = '/etc/ssh/sshd_config.d/60-cloudimg-settings.conf';
+  await rcSh('bash', ['-c', 'passwd -d root 2>/dev/null; true'], 5000);
+  await rcSh('bash', ['-c', "if [ -f " + conf + " ]; then sed -i 's/^PasswordAuthentication yes/PasswordAuthentication no/' " + conf + "; sed -i '/^KbdInteractiveAuthentication yes$/d' " + conf + "; fi"], 8000);
+  await rcSh('bash', ['-c', 'systemctl restart sshd 2>/dev/null || systemctl restart ssh'], 15000);
+  return { success: true };
+}
+
+/* ── rclone 設定 API ── */
+app.get('/api/rclone/config', (req, res) => {
+  try {
+    res.json(Object.assign({ success: true }, rcStatus()));
+  } catch (e) { sendErr(res, e.message, e.status || 500); }
+});
+
+app.post('/api/rclone/config', (req, res) => {
+  try {
+    const body = req.body || {};
+    const cfg = rcLoad();
+    if ('sources' in body) cfg.sources = bkNormSources(body.sources);
+    if ('remote' in body && typeof body.remote === 'string') cfg.remote = body.remote.trim();
+    if ('remotePath' in body) {
+      const p = rcNormRemotePath(body.remotePath);
+      if (p === null) return sendErr(res, '転送先パスが不正です');
+      cfg.remotePath = p;
+    }
+    if ('deleteExtra' in body) cfg.deleteExtra = !!body.deleteExtra;
+    if (body.watch && typeof body.watch === 'object') {
+      const merged = Object.assign({}, cfg.watch);
+      if ('enabled' in body.watch) merged.enabled = !!body.watch.enabled;
+      if ('mode' in body.watch) merged.mode = body.watch.mode;
+      if ('intervalSec' in body.watch) merged.intervalSec = body.watch.intervalSec;
+      if ('times' in body.watch) merged.times = body.watch.times;
+      if ('days' in body.watch) merged.days = body.watch.days;
+      /* バックアップパネルと同じ挙動: スケジュールが更新されたら自動で監視ON */
+      if ('mode' in body.watch || 'intervalSec' in body.watch || 'times' in body.watch || 'days' in body.watch) {
+        merged.enabled = true;
+      }
+      cfg.watch = bkNormWatch(merged);
+    }
+    const err = rcValidate(cfg, false);
+    if (err) return sendErr(res, err);
+    rcSave(cfg);
+    rcSetWatch(!!cfg.watch.enabled);
+    res.json({ success: true, watching: !!cfg.watch.enabled });
+  } catch (e) { sendErr(res, e.message, e.status || 500); }
+});
+
+app.post('/api/rclone/sources/add', (req, res) => {
+  try {
+    const rel = String((req.body || {}).path || '').trim().replace(/^\/+|\/+$/g, '');
+    if (!rel) return sendErr(res, 'フォルダを指定してください');
+    const err = bkCheckSourceDir(rel);
+    if (err) return sendErr(res, err);
+    const cfg = rcLoad();
+    cfg.sources = bkNormSources((cfg.sources || []).concat([rel]));
+    rcSave(cfg);
+    res.json({ success: true, sources: cfg.sources });
+  } catch (e) { sendErr(res, e.message, e.status || 500); }
+});
+
+app.post('/api/rclone/sources/remove', (req, res) => {
+  try {
+    const rel = String((req.body || {}).path || '').trim().replace(/^\/+|\/+$/g, '');
+    const cfg = rcLoad();
+    cfg.sources = (cfg.sources || []).filter(s => s !== rel);
+    rcSave(cfg);
+    res.json({ success: true, sources: cfg.sources });
+  } catch (e) { sendErr(res, e.message, e.status || 500); }
+});
+
+app.post('/api/rclone/run', (req, res) => {
+  try {
+    const r = rcRunAsync('manual');
+    if (r.alreadyRunning) return sendErr(res, 'rclone 転送がすでに実行中です', 409);
+    res.json({ success: true, started: true });
+  } catch (e) { sendErr(res, e.message, e.status || 500); }
+});
+
+app.get('/api/rclone/status', (req, res) => {
+  try {
+    res.json(Object.assign({ success: true }, rcStatus()));
+  } catch (e) { sendErr(res, e.message, e.status || 500); }
+});
+
+app.post('/api/rclone/watch', (req, res) => {
+  try {
+    const enabled = !!((req.body || {}).enabled);
+    const cfg = rcLoad();
+    cfg.watch.enabled = enabled;
+    rcSave(cfg);
+    const r = rcSetWatch(enabled);
+    res.json({ success: true, watching: r.watching });
+  } catch (e) { sendErr(res, e.message, e.status || 500); }
+});
+
+/* ── リモート（クラウドアカウント）API ── */
+app.get('/api/rclone/remotes', (req, res) => {
+  try {
+    res.json({ success: true, remotes: rcParseRemotes().map(r => ({ name: r.name, type: r.type })) });
+  } catch (e) { sendErr(res, e.message, e.status || 500); }
+});
+
+app.post('/api/rclone/remotes', (req, res) => {
+  try {
+    const body = req.body || {};
+    const name = String(body.name || '').trim();
+    const type = String(body.type || '').trim();
+    if (!name || !type) return sendErr(res, '名前とタイプは必須です');
+    if (!rcValidRemoteName(name)) return sendErr(res, '名前は英数字、ハイフン、アンダースコアのみ使用できます');
+    if (RC_REMOTE_TYPES.indexOf(type) < 0) return sendErr(res, 'サポートされていないタイプです');
+    if (rcParseRemotes().some(r => r.name === name)) return sendErr(res, '「' + name + '」は既に存在します');
+    const cur = rcReadConf();
+    rcWriteConf((cur.trim() ? cur.trim() + '\n' : '') + '[' + name + ']\ntype = ' + type);
+    res.json({ success: true, name, type });
+  } catch (e) { sendErr(res, e.message, e.status || 500); }
+});
+
+app.delete('/api/rclone/remotes/:name', (req, res) => {
+  try {
+    const name = req.params.name;
+    if (!rcValidRemoteName(name)) return sendErr(res, '名前が不正です');
+    let content = rcReadConf();
+    const re = new RegExp('\\n?\\[' + name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '\\][^\\[]*', 'g');
+    if (!re.test(content)) return sendErr(res, '「' + name + '」が見つかりません', 404);
+    content = content.replace(re, '').replace(/\n{3,}/g, '\n\n').trim();
+    rcWriteConf(content);
+    /* 削除したリモートを転送先にしていた場合は設定もクリアする */
+    const cfg = rcLoad();
+    if (cfg.remote === name) { cfg.remote = ''; rcSave(cfg); }
+    res.json({ success: true });
+  } catch (e) { sendErr(res, e.message, e.status || 500); }
+});
+
+app.post('/api/rclone/remotes/:name/test', (req, res) => {
+  try {
+    const name = req.params.name;
+    if (!rcValidRemoteName(name)) return sendErr(res, '名前が不正です');
+    const result = rcRcloneSync(['lsf', name + ':', '--max-depth', '1', '--dirs-only']);
+    if (result.ok) {
+      const folders = result.data ? result.data.split('\n').filter(Boolean).map(l => l.replace(/\/$/, '')) : [];
+      res.json({ success: true, folders });
+    } else {
+      res.json({ success: false, error: result.error });
+    }
+  } catch (e) { sendErr(res, e.message, e.status || 500); }
+});
+
+app.post('/api/rclone/target-check', (req, res) => {
+  try {
+    if (!bkHas('rclone')) return res.json({ success: false, error: 'rclone が見つかりません (' + pkgInstallHint('rclone') + ')' });
+    const body = req.body || {};
+    const cfg = rcLoad();
+    const name = (typeof body.remote === 'string' && body.remote.trim()) ? body.remote.trim() : cfg.remote;
+    const rp = rcNormRemotePath(('remotePath' in body) ? body.remotePath : cfg.remotePath);
+    if (!name) return res.json({ success: false, error: '転送先のリモートを選択してください' });
+    if (!rcValidRemoteName(name)) return res.json({ success: false, error: 'リモート名が不正です' });
+    if (!rcParseRemotes().some(r => r.name === name)) return res.json({ success: false, error: 'リモートが見つかりません: ' + name });
+    if (rp === null) return res.json({ success: false, error: '転送先パスが不正です' });
+    const dest = rp ? (name + ':' + rp) : (name + ':');
+    const mk = rcRcloneSync(['mkdir', dest]);
+    if (!mk.ok) return res.json({ success: false, error: '転送先を確認できません: ' + mk.error });
+    const ls = rcRcloneSync(['lsf', dest, '--max-depth', '1', '--dirs-only']);
+    if (!ls.ok) return res.json({ success: false, error: '転送先を確認できません: ' + ls.error });
+    res.json({ success: true, message: '転送先OK: ' + dest, dest });
+  } catch (e) { sendErr(res, e.message, e.status || 500); }
+});
+
+/* ── OAuth 認証 API（rclone authorize。rcloneGUI と同一フロー） ── */
+app.post('/api/rclone/auth/start', (req, res) => {
+  try {
+    const body = req.body || {};
+    const type = String(body.type || '').trim();
+    const remoteName = String(body.remoteName || '').trim();
+    if (RC_REMOTE_TYPES.indexOf(type) < 0) return sendErr(res, 'サポートされていないタイプです');
+    if (remoteName && !rcValidRemoteName(remoteName)) return sendErr(res, 'リモート名が不正です');
+    if (!bkHas('rclone')) return sendErr(res, 'rclone が見つかりません (' + pkgInstallHint('rclone') + ')');
+
+    /* 前回の rclone authorize が残っていれば片付ける。
+       自分で起動した分は確実に、取りこぼしは先頭が rclone のものだけに絞って掃除する
+       （広いパターンだと無関係なプロセスまで巻き込むため） */
+    for (const p of rcAuthProcs) { try { p.kill('SIGKILL'); } catch (e) {} }
+    rcAuthProcs.clear();
+    /* 取りこぼし対策の pkill は、直後に起動する authorize を巻き込まないよう同期で完了させる */
+    try { execFileSync('pkill', ['-9', '-f', '^[/a-zA-Z0-9._-]*rclone authorize'], { stdio: 'ignore', timeout: 5000 }); } catch (e) {}
+
+    const sessionId = 'auth_' + Date.now();
+    const proc = spawn('rclone', ['authorize', type, '--auth-no-open-browser'], {
+      env: rcRcloneEnv(), stdio: ['pipe', 'pipe', 'pipe']
+    });
+    rcAuthProcs.add(proc);
+    let authUrl = '';
+    let stdoutBuf = '';
+    const session = { proc, type, remoteName, token: null, done: false, authUrl: '', success: false };
+
+    proc.stderr.on('data', d => {
+      const text = d.toString();
+      const m = text.match(/(https?:\/\/[^\s"']+\/auth\?state=[^\s"']+)/);
+      if (m && !authUrl) authUrl = m[1].replace(/["']$/, '');
+    });
+    proc.stdout.on('data', d => { stdoutBuf += d.toString(); });
+    proc.on('close', (code) => {
+      const raw = stdoutBuf.trim();
+      rcAuthProcs.delete(proc);
+      console.log('[rclone auth ' + sessionId + '] authorize closed code=' + code);
+      /* rclone authorize は "Paste the following..." の後に JSON を出力する */
+      const jsonMatch = raw.match(/(\{[\s\S]*\})/);
+      if (jsonMatch) {
+        try { session.token = JSON.parse(jsonMatch[1]); } catch (e) {}
+      }
+      session.done = true;
+    });
+
+    rcAuthSessions.set(sessionId, session);
+
+    const check = setInterval(() => {
+      if (authUrl && !session.authUrl) session.authUrl = authUrl;
+      if (session.done && session.token && !session.success) {
+        clearInterval(check);
+        try {
+          rcWriteTokenToConfig(session.remoteName || ('remote_' + Date.now()), session.type, session.token);
+          session.success = true;
+        } catch (e) {
+          session.writeError = e.message;
+        }
+        /* ポーリング側が成功を確実に取得できるよう、少し保持してから破棄する */
+        setTimeout(() => rcAuthSessions.delete(sessionId), 60000);
+      }
+    }, 500);
+
+    setTimeout(() => {
+      clearInterval(check);
+      if (rcAuthSessions.has(sessionId)) {
+        try { session.proc.kill(); } catch (e) {}
+        rcAuthSessions.delete(sessionId);
+      }
+    }, RC_AUTH_TIMEOUT_MS);
+
+    res.json({ success: true, sessionId, authUrl: null });
+  } catch (e) { sendErr(res, e.message, e.status || 500); }
+});
+
+app.get('/api/rclone/auth/poll/:sessionId', (req, res) => {
+  try {
+    const session = rcAuthSessions.get(req.params.sessionId);
+    if (!session) return res.json({ success: true, done: true, authOk: false, error: 'セッションが見つかりません' });
+    if (session.success || (session.done && session.token)) {
+      return res.json({ success: true, done: true, authOk: true });
+    }
+    if (session.done && !session.token) {
+      return res.json({ success: true, done: true, authOk: false, error: session.writeError || 'トークン取得に失敗しました' });
+    }
+    res.json({ success: true, done: false, authOk: false, authUrl: session.authUrl || null });
+  } catch (e) { sendErr(res, e.message, e.status || 500); }
+});
+
+/* rcloneGUI と同じ一時SSH（OAuth リダイレクト用トンネル） */
+app.post('/api/rclone/ssh/setup', async (req, res) => {
+  try { res.json(await rcSetupSsh()); }
+  catch (e) { sendErr(res, e.message, e.status || 500); }
+});
+
+app.post('/api/rclone/ssh/teardown', async (req, res) => {
+  try { res.json(await rcTeardownSsh()); }
+  catch (e) { sendErr(res, e.message, e.status || 500); }
+});
+
+/* ── ジョブ履歴 API ── */
+app.get('/api/rclone/jobs', (req, res) => {
+  try {
+    res.json({ success: true, jobs: rcListJobs() });
+  } catch (e) { sendErr(res, e.message, e.status || 500); }
+});
+
+app.delete('/api/rclone/jobs/:id', (req, res) => {
+  try {
+    const id = req.params.id;
+    if (!rcValidJobId(id)) return sendErr(res, 'ジョブIDが不正です');
+    const f = rcJobPath(id);
+    if (!fs.existsSync(f)) return sendErr(res, 'ジョブが見つかりません', 404);
+    fs.unlinkSync(f);
+    res.json({ success: true });
+  } catch (e) { sendErr(res, e.message, e.status || 500); }
+});
+
 
 /* ── 起動時の自動復元（Web サーバ） ── */
 async function bootRestoreWeb() {
@@ -3061,6 +3795,9 @@ async function bootRestoreWeb() {
 
 /* 起動時に前回の実行結果をメモリへ1回だけ復元する（bkLoad は副作用なしのためここで行う） */
 try { bkLastRun = bkLoad().lastRun || null; } catch (e) { bkLastRun = null; }
+/* rclone も同様に復元し、設定ディレクトリを用意する */
+try { rcLastRun = rcLoad().lastRun || null; } catch (e) { rcLastRun = null; }
+rcEnsureDirs();
 
 /* ── WebSocket ターミナル（servEX と同方式。サービス実行ユーザーで bash を起動） ── */
 const termServer = http.createServer(app);
@@ -3187,4 +3924,5 @@ termServer.listen(PORT, HOST, () => {
   (async () => { try { const b = await ooBridgeInfo(); if (b) ooEnsureBridgeListen(b.gateway); } catch (e) {} })();
   bootRestoreWeb();
   bkEnsureWatch();
+  rcEnsureWatch();
 });

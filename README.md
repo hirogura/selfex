@@ -192,6 +192,21 @@ sudo rm -rf /opt/onlyoffice
 - シェルはサービス実行ユーザーで動作します
 - xterm.js は `public/vendor/` に同梱しているため外部 CDN は不要です
 
+## rclone バックアップ（クラウド転送）
+
+ヘッダーの「バックアップパネル開閉」ボタン右にある「rcloneパネル開閉」ボタンで、右側に rclone パネル（rcloneGUI 相当）を表示します（開閉状態は記憶されます）。
+
+- クラウドアカウント（Googleドライブ / OneDrive）の追加・OAuth認証・テスト・削除
+  - 認証は `rclone authorize` を使用します。ブラウザからのリダイレクトを受けるため、認証ダイアログの「一時SSHを有効化」で SSH トンネル（`ssh -L 53682:127.0.0.1:53682 root@<ホスト>`）を張ってから URL を開きます
+- コピー元（ソースフォルダ）は複数指定でき、転送先は「リモート名＋パス」の1箇所のみ
+  - 各ソースはフォルダ名を保って転送先直下へコピーされます（例: `Photos/2026` → `gdrive:backup/2026`）
+  - 「ソースに無いファイルを削除する」をONにすると `rclone sync` になり、転送先の余分なファイルを削除します
+- 実行・監視はバックアップパネルと同じ仕様（間隔実行 / 指定時刻＋曜日）
+- ジョブ履歴（完了・失敗・実行中、ログ表示、削除）を保持します（30日）
+- 設定: `/var/lib/selfex/rclone.json`、rclone 設定: `/var/lib/selfex/rclone/rclone.conf`、履歴: `/var/lib/selfex/rclone/jobs/`
+- rclone が未導入の場合は `apt install rclone` などで導入してください
+- 既存の rcloneGUI（`/opt/rclonegui`）の `rclone.conf` がある環境では、初回にその設定を取り込みます
+
 ## バージョン
 
-v.2.2.0
+v.2.6.0

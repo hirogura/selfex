@@ -32,6 +32,7 @@
         <button class="action-btn" id="btn-createfile" title="新規ファイル作成"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 00-2 2v16a2 2 0 002 2h12a2 2 0 002-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="12" y1="18" x2="12" y2="12"/><line x1="9" y1="15" x2="15" y2="15"/></svg></button>
         <button class="action-btn" id="btn-toggle-apps" title="アプリ連携パネル開閉"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="18" height="18" rx="2" ry="2"/><line x1="15" y1="3" x2="15" y2="21"/></svg></button>
         <button class="action-btn" id="btn-toggle-backup" title="バックアップパネル開閉"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3v12"/><path d="M6.5 10.5L12 16l5.5-5.5"/><path d="M4 16v3a2 2 0 002 2h12a2 2 0 002-2v-3"/></svg></button>
+        <button class="action-btn" id="btn-toggle-rclone" title="rcloneパネル開閉"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 14.899A7 7 0 1 1 15.71 8h1.79a4.5 4.5 0 0 1 2.5 8.242"/><path d="M12 12v9"/><path d="m8 17 4 4 4-4"/></svg></button>
       </div>
     </header>
     <div class="main-container">
@@ -274,6 +275,112 @@
           </div>
         </div>
       </aside>
+      <aside class="backup-panel rclone-panel hidden" id="rclone-panel">
+        <div class="sidebar-header"><h3>rclone</h3><button class="oo-refresh" id="rc-close" title="閉じる">✕</button></div>
+        <div class="backup-panel-body">
+          <div class="oo-card" id="rc-remote-card">
+            <div class="oo-card-header">
+              <span class="oo-logo"><svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="#0067c0" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M17.5 19H9a7 7 0 1 1 6.71-9h1.79a4.5 4.5 0 1 1 0 9Z"/></svg></span>
+              <div class="oo-title-wrap">
+                <div class="oo-title">クラウドアカウント</div>
+                <div class="oo-status"><span id="rc-remote-status">状態確認中...</span></div>
+              </div>
+              <button class="oo-refresh" id="rc-remote-refresh" title="状態を再確認"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="23 4 23 10 17 10"/><polyline points="1 20 1 14 7 14"/><path d="M3.51 9a9 9 0 0114.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0020.49 15"/></svg></button>
+            </div>
+            <p class="oo-hint">Googleドライブ / OneDrive を追加・認証すると、転送先として選べるようになります。</p>
+            <div class="rc-remotes" id="rc-remotes"></div>
+            <div class="bk-add-row">
+              <select id="rc-remote-type" class="web-select rc-type-select">
+                <option value="drive">Googleドライブ</option>
+                <option value="onedrive">OneDrive</option>
+              </select>
+              <input type="text" id="rc-remote-name" class="dialog-input smb-input" placeholder="例: gdrive" autocomplete="off">
+              <button class="oo-btn bk-mini-btn" id="rc-remote-add" title="追加して認証">追加</button>
+            </div>
+            <div class="bk-msg" id="rc-remote-msg"></div>
+          </div>
+          <div class="oo-card" id="rc-main-card" style="margin-top:10px">
+            <div class="oo-card-header">
+              <span class="oo-logo"><svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="#0067c0" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 14.899A7 7 0 1 1 15.71 8h1.79a4.5 4.5 0 0 1 2.5 8.242"/><path d="M12 12v9"/><path d="m8 17 4 4 4-4"/></svg></span>
+              <div class="oo-title-wrap">
+                <div class="oo-title">rclone バックアップ設定</div>
+                <div class="oo-status"><span id="rc-status-text">状態確認中...</span></div>
+              </div>
+              <button class="oo-refresh" id="rc-refresh" title="状態を再確認"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="23 4 23 10 17 10"/><polyline points="1 20 1 14 7 14"/><path d="M3.51 9a9 9 0 0114.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0020.49 15"/></svg></button>
+            </div>
+            <p class="oo-hint">rclone でソースフォルダを転送先（クラウド1箇所）へコピーします（固定オプション: <code>--stats 2s --stats-one-line -v</code>）。フォルダ構成は維持されます。</p>
+            <label class="web-label">ソースフォルダ（複数可）</label>
+            <div class="bk-sources" id="rc-sources"></div>
+            <div class="bk-add-row">
+              <input type="text" id="rc-source-input" class="dialog-input smb-input" placeholder="例: Photos/2026">
+              <button class="oo-btn" id="rc-source-add" title="ソースに追加">追加</button>
+            </div>
+            <label class="web-label" for="rc-remote-select">転送先リモート（1箇所）</label>
+            <select id="rc-remote-select" class="web-select"></select>
+            <label class="web-label" for="rc-remote-path">転送先パス</label>
+            <input type="text" id="rc-remote-path" class="dialog-input smb-input" placeholder="例: backup/selfex" autocomplete="off">
+            <div class="web-actions">
+              <button class="oo-btn" id="rc-target-check">フォルダ確認</button>
+            </div>
+            <div class="bk-msg" id="rc-target-msg"></div>
+            <div class="bk-fixed">除外: <code>.upload-tmp/</code>（固定）</div>
+            <label class="smb-check"><input type="checkbox" id="rc-delete"> ソースに無いファイルを削除する</label>
+          </div>
+          <div class="oo-card" id="rc-run-card" style="margin-top:10px">
+            <div class="oo-card-header">
+              <span class="oo-logo"><svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="#16a34a" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="5 3 19 12 5 21 5 3"/></svg></span>
+              <div class="oo-title-wrap">
+                <div class="oo-title">実行・監視</div>
+              </div>
+            </div>
+            <label class="web-label" for="rc-mode">監視方式</label>
+            <select id="rc-mode" class="web-select">
+              <option value="interval">間隔で実行</option>
+              <option value="time">指定時刻に実行</option>
+            </select>
+            <div id="rc-interval-row">
+              <label class="web-label" for="rc-interval">監視間隔</label>
+              <select id="rc-interval" class="web-select">
+                <option value="60">1分ごと</option>
+                <option value="300">5分ごと</option>
+                <option value="900">15分ごと</option>
+                <option value="1800">30分ごと</option>
+                <option value="3600">60分ごと</option>
+              </select>
+            </div>
+            <div id="rc-time-row">
+              <label class="web-label">時刻（複数可）</label>
+              <div class="bk-add-row">
+                <span id="rc-times"></span>
+                <button class="oo-btn bk-mini-btn" id="rc-time-add" type="button" title="時刻を追加">＋追加</button>
+              </div>
+              <label class="web-label">曜日</label>
+              <div id="rc-days"></div>
+              <div class="oo-hint">指定した曜日・時刻になったときに実行します。</div>
+            </div>
+            <div class="web-actions">
+              <button class="oo-btn primary" id="rc-save">設定を保存</button>
+              <button class="oo-btn primary" id="rc-run">コピー実行</button>
+            </div>
+            <div class="web-actions">
+              <button class="oo-btn autostart off" id="rc-watch">監視開始</button>
+            </div>
+            <div class="oo-status" id="rc-status"></div>
+            <pre class="oo-log" id="rc-log" hidden></pre>
+          </div>
+          <div class="oo-card" id="rc-jobs-card" style="margin-top:10px">
+            <div class="oo-card-header">
+              <span class="oo-logo"><svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="#7e57c2" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 12a9 9 0 1 0 9-9 9.75 9.75 0 0 0-6.74 2.74L3 8"/><path d="M3 3v5h5"/><path d="M12 7v5l4 2"/></svg></span>
+              <div class="oo-title-wrap">
+                <div class="oo-title">ジョブ履歴</div>
+                <div class="oo-status"><span id="rc-jobs-count"></span></div>
+              </div>
+              <button class="oo-refresh" id="rc-jobs-refresh" title="履歴を再読み込み"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="23 4 23 10 17 10"/><polyline points="1 20 1 14 7 14"/><path d="M3.51 9a9 9 0 0114.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0020.49 15"/></svg></button>
+            </div>
+            <div class="rc-jobs" id="rc-jobs"></div>
+          </div>
+        </div>
+      </aside>
     </div>
     <footer class="status-bar"><span id="status-text">準備完了</span><div class="status-progress" id="status-progress" hidden><div class="status-progress-bar" id="status-progress-bar"></div></div></footer>
   </div>
@@ -410,6 +517,30 @@
       <div class="dialog-header"><h3>詳細情報</h3><button class="dialog-close" id="info-close">✕</button></div>
       <div class="dialog-body"><div class="info-grid" id="info-content"></div></div>
       <div class="dialog-footer"><button class="btn" id="info-close-btn">閉じる</button></div>
+    </div>
+  </div>
+  <div class="dialog-overlay" id="rc-auth-dialog">
+    <div class="dialog">
+      <div class="dialog-header"><h3 id="rc-auth-title">アカウント認証</h3><button class="dialog-close" id="rc-auth-cancel">✕</button></div>
+      <div class="dialog-body">
+        <div class="oo-status" id="rc-auth-status">認証サーバー起動中...</div>
+        <div id="rc-auth-url-area" hidden>
+          <div class="bk-fixed" style="margin-top:10px">1. ブラウザからリダイレクトを受けるための SSH トンネル</div>
+          <div class="rc-cmd-row"><code id="rc-auth-ssh-cmd"></code><button class="oo-btn bk-mini-btn" id="rc-auth-ssh-copy" type="button">コピー</button></div>
+          <div class="web-actions">
+            <button class="oo-btn" id="rc-auth-ssh-setup" type="button">一時SSHを有効化</button>
+            <button class="oo-btn" id="rc-auth-ssh-teardown" type="button">SSH設定を削除</button>
+          </div>
+          <div class="bk-fixed" style="margin-top:10px">2. ブラウザでログイン</div>
+          <div class="rc-cmd-row">
+            <input type="text" id="rc-auth-url-input" class="dialog-input smb-input" readonly>
+            <a id="rc-auth-url-link" href="#" target="_blank" rel="noopener" class="oo-btn bk-mini-btn">開く</a>
+            <button class="oo-btn bk-mini-btn" id="rc-auth-url-copy" type="button">コピー</button>
+          </div>
+        </div>
+        <div id="rc-auth-done-area" hidden style="text-align:center;padding:20px 0;color:#1a7f37;font-weight:600">認証完了</div>
+      </div>
+      <div class="dialog-footer"><button class="btn" id="rc-auth-close-btn">閉じる</button></div>
     </div>
   </div>
   <script src="vendor/xterm.js"></script>

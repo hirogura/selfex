@@ -592,6 +592,130 @@ app.post('/api/copy-batch', (req, res) => {
   res.json({ success: true, copied, errors });
 });
 
+/* ── 進捗付きコピー（ステータスバー進捗バー表示用） ── */
+const copyJobs = new Map();
+function copyJobTotalSize(abs) {
+  let total = 0;
+  try {
+    const st = fs.statSync(abs);
+    if (!st.isDirectory()) return st.size;
+    const entries = fs.readdirSync(abs);
+    for (const e of entries) total += copyJobTotalSize(path.join(abs, e));
+  } catch (e) {}
+  return total;
+}
+function copyFileWithProgress(src, dest, job) {
+  return new Promise((resolve, reject) => {
+    let mode = 0;
+    try { mode = fs.statSync(src).mode; } catch (e) {}
+    const rs = fs.createReadStream(src);
+    const ws = fs.createWriteStream(dest);
+    rs.on('data', (chunk) => { job.copiedBytes += chunk.length; });
+    rs.on('error', (e) => { try { ws.destroy(); } catch (_) {} reject(e); });
+    ws.on('error', reject);
+    ws.on('finish', () => {
+      if (mode) { try { fs.chmodSync(dest, mode); } catch (e) {} }
+      resolve();
+    });
+    rs.pipe(ws);
+  });
+}
+async function copyRecursiveWithProgress(src, dest, job) {
+  const st = fs.statSync(src);
+  if (st.isDirectory()) {
+    fs.mkdirSync(dest, { recursive: true });
+    const entries = fs.readdirSync(src);
+    for (const e of entries) {
+      await copyRecursiveWithProgress(path.join(src, e), path.join(dest, e), job);
+    }
+  } else {
+    fs.mkdirSync(path.dirname(dest), { recursive: true });
+    await copyFileWithProgress(src, dest, job);
+  }
+}
+async function runCopyJob(job, pairs) {
+  for (const item of pairs) {
+    job.currentName = path.basename(item.src);
+    try {
+      await copyRecursiveWithProgress(item.src, item.dest, job);
+      job.copied++;
+    } catch (e) {
+      job.errors.push({ path: item.rel, error: e.message });
+    }
+    job.doneFiles++;
+  }
+  job.running = false;
+  job.done = true;
+  job.finishedAt = Date.now();
+}
+app.post('/api/copy-batch/start', (req, res) => {
+  const paths = Array.isArray(req.body.paths) ? req.body.paths : [];
+  let destDir;
+  try { destDir = safeResolve(req.body.destPath); } catch (e) { return sendErr(res, e.message); }
+  try {
+    if (!isDir(destDir)) return sendErr(res, 'コピー先がフォルダではありません');
+  } catch (e) {
+    return sendErr(res, 'コピー先がフォルダではありません');
+  }
+  const errors = [];
+  const pairs = [];
+  for (const p of paths) {
+    try {
+      const src = safeResolve(p);
+      const dest = path.join(destDir, path.basename(src));
+      if (src === dest) continue;
+      if (fs.existsSync(dest)) throw new Error('同じ名前のファイルが既に存在します: ' + path.basename(src));
+      pairs.push({ src, dest, rel: p });
+    } catch (e) {
+      errors.push({ path: p, error: e.message });
+    }
+  }
+  let totalBytes = 0;
+  for (const item of pairs) totalBytes += copyJobTotalSize(item.src);
+  const jobId = crypto.randomBytes(8).toString('hex');
+  const job = {
+    id: jobId, running: true, done: false,
+    totalFiles: pairs.length, doneFiles: 0,
+    totalBytes, copiedBytes: 0,
+    currentName: pairs.length ? path.basename(pairs[0].src) : '',
+    copied: 0, errors, startedAt: Date.now(), finishedAt: 0
+  };
+  copyJobs.set(jobId, job);
+  setTimeout(() => { copyJobs.delete(jobId); }, 5 * 60 * 1000);
+  if (!pairs.length) {
+    job.running = false;
+    job.done = true;
+    job.finishedAt = Date.now();
+  } else {
+    runCopyJob(job, pairs).catch(() => {
+      job.running = false;
+      job.done = true;
+      job.finishedAt = Date.now();
+    });
+  }
+  res.json({ success: true, jobId, totalFiles: job.totalFiles, totalBytes: job.totalBytes });
+});
+app.get('/api/copy-batch/status', (req, res) => {
+  const job = copyJobs.get(String(req.query.jobId || ''));
+  if (!job) return sendErr(res, 'コピージョブが見つかりません', 404);
+  let percent = 0;
+  if (job.totalBytes > 0) {
+    percent = Math.min(100, (job.copiedBytes / job.totalBytes) * 100);
+  } else if (job.totalFiles > 0) {
+    percent = Math.min(100, (job.doneFiles / job.totalFiles) * 100);
+  } else {
+    percent = 100;
+  }
+  if (!job.running) percent = 100;
+  res.json({
+    success: true, running: job.running, done: job.done,
+    totalFiles: job.totalFiles, doneFiles: job.doneFiles,
+    totalBytes: job.totalBytes, copiedBytes: job.copiedBytes,
+    percent: Math.round(percent * 10) / 10,
+    currentName: job.currentName, copied: job.copied, errors: job.errors
+  });
+});
+
 app.post('/api/delete', (req, res) => {
   try {
     const abs = safeResolve(req.body.path);

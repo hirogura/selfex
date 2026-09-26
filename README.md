@@ -209,4 +209,4 @@ sudo rm -rf /opt/onlyoffice
 
 ## バージョン
 
-v.2.6.0
+v.2.6.1

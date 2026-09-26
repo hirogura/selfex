@@ -87,6 +87,7 @@ body{font-family:"Segoe UI Variable","Segoe UI",system-ui,-apple-system,sans-ser
 .dialog-overlay.show{display:flex}
 .dialog{background:var(--bg-primary);border-radius:12px;width:480px;max-width:90vw;max-height:80vh;display:flex;flex-direction:column;box-shadow:0 8px 40px rgba(0,0,0,.25)}
 .dialog.small{width:360px}
+.dialog.drop-action{width:480px}
 .dialog-header{display:flex;align-items:center;justify-content:space-between;padding:16px 20px;border-bottom:1px solid var(--border-color)}
 .dialog-header h3{font-size:15px;font-weight:600}
 .dialog-close{background:none;border:none;font-size:16px;cursor:pointer;padding:4px 8px;color:var(--text-secondary);border-radius:var(--radius-sm);transition:background .1s}

@@ -2636,6 +2636,72 @@ function bkSshDiag(ssh) {
   };
 }
 
+function bkKnownHostsPath() {
+  try { return path.join(require('os').homedir(), '.ssh', 'known_hosts'); }
+  catch (e) { return '/root/.ssh/known_hosts'; }
+}
+
+/* ssh のホスト鍵エラーを検出する。
+   - REMOTE HOST IDENTIFICATION HAS CHANGED (接続先の作り直し等で鍵が変わった)
+   - Offending XXX key in /root/.ssh/known_hosts:3 (古い登録が残っている)
+   - Host key verification failed (初回・不一致で検証失敗)
+   検出したら fingerprint / known_hosts 行番号等も抜き出して返す。 */
+function bkParseHostKeyError(log) {
+  const s = String(log || '');
+  const changed = /REMOTE HOST IDENTIFICATION HAS CHANGED/i.test(s)
+    || /Offending \S+ key in \S*known_hosts/i.test(s)
+    || /Host key verification failed/i.test(s);
+  if (!changed) return { changed: false };
+  let fingerprint = '';
+  let m = s.match(/fingerprint for \S+ key[^\n]*?is:? ([A-Za-z0-9+/=:_-]+)/i)
+    || s.match(/(SHA256:[A-Za-z0-9+/=]+)/);
+  if (m) fingerprint = m[1];
+  let knownHosts = '', line = '';
+  m = s.match(/Offending \S+ key in ([^\s:]+):(\d+)/);
+  if (m) { knownHosts = m[1]; line = m[2]; }
+  if (!knownHosts) {
+    m = s.match(/Add correct host key in ([^\s]+) to get rid/i);
+    if (m) knownHosts = m[1];
+  }
+  if (!knownHosts) knownHosts = bkKnownHostsPath();
+  let suggestedHost = '';
+  m = s.match(/ssh-keygen -f '([^']+)' -R '([^']+)'/);
+  if (m) suggestedHost = m[2];
+  return { changed: true, fingerprint, knownHosts, line, suggestedHost };
+}
+
+/* known_hosts から指定ホストの古い登録を削除する。
+   非標準ポートの場合は [host]:port 形式のエントリも併せて消す。 */
+async function bkRemoveKnownHost(host, port) {
+  const h = String(host || '').trim();
+  if (!h) throw Object.assign(new Error('host required'), { status: 400 });
+  if (!/^[A-Za-z0-9._-]+$/.test(h)) throw Object.assign(new Error('不正なホスト名です'), { status: 400 });
+  if (h.length > 253) throw Object.assign(new Error('不正なホスト名です'), { status: 400 });
+  const kh = bkKnownHostsPath();
+  let exists = false;
+  try { exists = fs.statSync(kh).isFile(); } catch (e) { exists = false; }
+  if (!exists) return { ok: true, removed: false, knownHosts: kh };
+  const targets = [h];
+  const p = String(port || '22').trim() || '22';
+  if (p !== '22') targets.push('[' + h + ']:' + p);
+  let removed = false;
+  let lastOut = '';
+  for (const t of targets) {
+    try {
+      const r = await bkExec('ssh-keygen', ['-f', kh, '-R', t], {}, 15000);
+      lastOut += String((r.stdout || '') + (r.stderr || ''));
+      removed = true;
+    } catch (e) {
+      const msg = String((e.stdout || '') + (e.stderr || '') + (e.message || ''));
+      /* 未登録の場合 ssh-keygen は "not found" 系メッセージで非0終了する。
+         これは正常 (消すものが無い) として扱う。 */
+      if (/not found|does not exist|No such/i.test(msg)) { lastOut += msg; continue; }
+      throw new Error('known_hosts の削除に失敗しました: ' + msg.slice(0, 500));
+    }
+  }
+  return { ok: true, removed, knownHosts: kh, detail: lastOut.slice(0, 500) };
+}
+
 function bkSshHint(ssh, diag) {
   const hints = [];
   if (diag.passwordSet && !diag.sshpassAvailable) {
@@ -2670,10 +2736,23 @@ async function bkTestSsh(ssh) {
     const full = bkSshFull(ssh, [dest, 'echo', 'ok']);
     const r = await bkExec(full.cmd, full.args, bkSshEnv(ssh), BK_SSH_TIMEOUT);
     if ((r.stdout || '').trim().endsWith('ok')) return { ok: true, message: 'SSH接続OK', diagnostics: diag };
-    return { ok: false, error: 'ssh connection failed: ' + ((r.stdout + r.stderr) || '').trim().slice(0, 2000), diagnostics: diag };
+    const log = ((r.stdout + r.stderr) || '').trim().slice(0, 2000);
+    const hk = bkParseHostKeyError(log);
+    if (hk.changed) {
+      return { ok: false, error: 'ssh connection failed: ' + log, diagnostics: diag,
+        hostKeyChanged: true, hostKey: { host, port: String((ssh || {}).port || '22'), fingerprint: hk.fingerprint, knownHosts: hk.knownHosts, line: hk.line } };
+    }
+    return { ok: false, error: 'ssh connection failed: ' + log, diagnostics: diag };
   } catch (e) {
     const log = String((e.stdout || '') + (e.stderr || '') + (e.message || '')).slice(0, 2000);
+    const hk = bkParseHostKeyError(log);
     let err = 'ssh connection failed: ' + log;
+    if (hk.changed) {
+      err += ' [ヒント: 接続先のホスト鍵が変更されています。古い登録を削除して再接続してください'
+        + (hk.fingerprint ? ' (新しい鍵: ' + hk.fingerprint + ')' : '') + ']';
+      return { ok: false, error: err, diagnostics: diag,
+        hostKeyChanged: true, hostKey: { host, port: String((ssh || {}).port || '22'), fingerprint: hk.fingerprint, knownHosts: hk.knownHosts, line: hk.line } };
+    }
     if (/Permission denied/i.test(log)) err += ' [ヒント: ' + bkSshHint(ssh, diag) + ']';
     return { ok: false, error: err, diagnostics: diag };
   }
@@ -2695,13 +2774,29 @@ async function bkCheckTarget(target, ssh, create) {
       try { await run(['test', '-d', remote]); } catch (e) { existed = false; }
       if (!existed && create !== false) {
         try { await run(['mkdir', '-p', remote]); }
-        catch (e) { return { ok: false, error: 'mkdir remote failed: ' + String((e.stdout || '') + (e.stderr || e.message || '')).slice(0, 2000) }; }
+        catch (e) {
+          const m = String((e.stdout || '') + (e.stderr || e.message || '')).slice(0, 2000);
+          const hk = bkParseHostKeyError(m);
+          if (hk.changed) return { ok: false, error: 'mkdir remote failed: ' + m,
+            hostKeyChanged: true, hostKey: { host: String((ssh || {}).host || '').trim(), port: String((ssh || {}).port || '22'), fingerprint: hk.fingerprint, knownHosts: hk.knownHosts, line: hk.line } };
+          return { ok: false, error: 'mkdir remote failed: ' + m };
+        }
       }
       try { await run(['test', '-d', remote]); }
-      catch (e) { return { ok: false, error: 'remote target not found: ' + String((e.stdout || '') + (e.stderr || '')).slice(0, 2000) }; }
+      catch (e) {
+        const m = String((e.stdout || '') + (e.stderr || '')).slice(0, 2000);
+        const hk = bkParseHostKeyError(m);
+        if (hk.changed) return { ok: false, error: 'remote target not found: ' + m,
+          hostKeyChanged: true, hostKey: { host: String((ssh || {}).host || '').trim(), port: String((ssh || {}).port || '22'), fingerprint: hk.fingerprint, knownHosts: hk.knownHosts, line: hk.line } };
+        return { ok: false, error: 'remote target not found: ' + m };
+      }
       return { ok: true, created: !existed, message: existed ? 'フォルダOK（既存）' : 'フォルダを作成しました' };
     } catch (e) {
-      return { ok: false, error: String(e.message || e).slice(0, 2000) };
+      const m = String(e.message || e).slice(0, 2000);
+      const hk = bkParseHostKeyError(m);
+      if (hk.changed) return { ok: false, error: m,
+        hostKeyChanged: true, hostKey: { host: String((ssh || {}).host || '').trim(), port: String((ssh || {}).port || '22'), fingerprint: hk.fingerprint, knownHosts: hk.knownHosts, line: hk.line } };
+      return { ok: false, error: m };
     }
   }
   if (!path.isAbsolute(tgt)) return { ok: false, error: 'target must be absolute' };
@@ -3009,7 +3104,26 @@ app.post('/api/backup/ssh-test', async (req, res) => {
     const ssh = bkSshFromBody(req.body || {});
     const r = await bkTestSsh(ssh);
     if (r.ok) res.json({ success: true, message: r.message, diagnostics: r.diagnostics });
-    else res.json({ success: false, error: r.error, diagnostics: r.diagnostics, needSshpassInstall: !!r.needSshpassInstall });
+    else res.json({ success: false, error: r.error, diagnostics: r.diagnostics, needSshpassInstall: !!r.needSshpassInstall,
+      hostKeyChanged: !!r.hostKeyChanged, hostKey: r.hostKey || null });
+  } catch (e) { sendErr(res, e.message, e.status || 500); }
+});
+
+/* known_hosts に残った古いホスト鍵を削除する。
+   接続先の作り直し等で鍵が変わった場合、接続確認で hostKeyChanged が返る。
+   フロントでユーザー確認が取れた場合のみここを呼び、次の接続確認で新鍵が自動登録される。 */
+app.post('/api/backup/ssh-knownhost/reset', async (req, res) => {
+  try {
+    const body = req.body || {};
+    const src = (body.ssh && typeof body.ssh === 'object') ? body.ssh : body;
+    let host = String(src.host || '').trim();
+    let port = String(src.port || '22').trim() || '22';
+    if (!host) {
+      /* フォーム値が送られていない場合は保存済み設定を使う */
+      try { const cfg = bkLoad(); host = String((cfg.ssh || {}).host || '').trim() || host; port = String((cfg.ssh || {}).port || '22').trim() || port; } catch (e) {}
+    }
+    const r = await bkRemoveKnownHost(host, port);
+    res.json({ success: true, message: 'ホスト鍵の古い登録を削除しました。再度「接続確認」してください。', knownHosts: r.knownHosts, removed: r.removed });
   } catch (e) { sendErr(res, e.message, e.status || 500); }
 });
 
@@ -3037,7 +3151,7 @@ app.post('/api/backup/target-check', async (req, res) => {
     const ssh = bkSshFromBody(body);
     const r = await bkCheckTarget(target, ssh, true);
     if (r.ok) res.json({ success: true, message: r.message, created: r.created });
-    else res.json({ success: false, error: r.error });
+    else res.json({ success: false, error: r.error, hostKeyChanged: !!r.hostKeyChanged, hostKey: r.hostKey || null });
   } catch (e) { sendErr(res, e.message, e.status || 500); }
 });
 

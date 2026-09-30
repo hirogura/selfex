@@ -592,8 +592,22 @@ app.post('/api/copy-batch', (req, res) => {
   res.json({ success: true, copied, errors });
 });
 
-/* ── 進捗付きコピー（ステータスバー進捗バー表示用） ── */
+/* ── 進捗付きコピー（ステータスバー進捗バー表示用） ──
+   大容量ファイル（数GB級のISO等）に対応するため:
+   - ジョブ保持は2時間＋status参照毎に延長（5分では巨大ファイルのコピー中に失効する）
+   - 読み書きエラー時は双方向にストリームを破棄し、部分ファイルを削除
+     （残骸が残ると次回リトライが「同名ファイル存在」で即失敗するため）
+   - バッファを1MBに拡大してUSB/HDD等の低速メディアでも効率化 */
 const copyJobs = new Map();
+const COPY_JOB_TTL_MS = 2 * 60 * 60 * 1000;
+function copyJobTouch(job) {
+  try { if (job.timer) clearTimeout(job.timer); } catch (e) {}
+  job.timer = setTimeout(() => { copyJobs.delete(job.id); }, COPY_JOB_TTL_MS);
+  try { if (job.timer.unref) job.timer.unref(); } catch (e) {}
+}
+function copyJobRemovePartial(dest) {
+  try { fs.rmSync(dest, { recursive: true, force: true }); } catch (e) {}
+}
 function copyJobTotalSize(abs) {
   let total = 0;
   try {
@@ -608,12 +622,23 @@ function copyFileWithProgress(src, dest, job) {
   return new Promise((resolve, reject) => {
     let mode = 0;
     try { mode = fs.statSync(src).mode; } catch (e) {}
-    const rs = fs.createReadStream(src);
-    const ws = fs.createWriteStream(dest);
+    let settled = false;
+    const fail = (e) => {
+      if (settled) return;
+      settled = true;
+      try { rs.destroy(); } catch (_) {}
+      try { ws.destroy(); } catch (_) {}
+      copyJobRemovePartial(dest);
+      reject(e);
+    };
+    const rs = fs.createReadStream(src, { highWaterMark: 1024 * 1024 });
+    const ws = fs.createWriteStream(dest, { highWaterMark: 1024 * 1024 });
     rs.on('data', (chunk) => { job.copiedBytes += chunk.length; });
-    rs.on('error', (e) => { try { ws.destroy(); } catch (_) {} reject(e); });
-    ws.on('error', reject);
+    rs.on('error', fail);
+    ws.on('error', fail);
     ws.on('finish', () => {
+      if (settled) return;
+      settled = true;
       if (mode) { try { fs.chmodSync(dest, mode); } catch (e) {} }
       resolve();
     });
@@ -640,6 +665,7 @@ async function runCopyJob(job, pairs) {
       await copyRecursiveWithProgress(item.src, item.dest, job);
       job.copied++;
     } catch (e) {
+      copyJobRemovePartial(item.dest);
       job.errors.push({ path: item.rel, error: e.message });
     }
     job.doneFiles++;
@@ -681,7 +707,7 @@ app.post('/api/copy-batch/start', (req, res) => {
     copied: 0, errors, startedAt: Date.now(), finishedAt: 0
   };
   copyJobs.set(jobId, job);
-  setTimeout(() => { copyJobs.delete(jobId); }, 5 * 60 * 1000);
+  copyJobTouch(job);
   if (!pairs.length) {
     job.running = false;
     job.done = true;
@@ -698,6 +724,7 @@ app.post('/api/copy-batch/start', (req, res) => {
 app.get('/api/copy-batch/status', (req, res) => {
   const job = copyJobs.get(String(req.query.jobId || ''));
   if (!job) return sendErr(res, 'コピージョブが見つかりません', 404);
+  copyJobTouch(job);
   let percent = 0;
   if (job.totalBytes > 0) {
     percent = Math.min(100, (job.copiedBytes / job.totalBytes) * 100);
